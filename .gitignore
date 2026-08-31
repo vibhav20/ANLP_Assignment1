@@ -1,0 +1,9 @@
+anlp_env/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/
+*.pth
+*.ckpt
+wandb/
+.DS_Store
