@@ -176,7 +176,7 @@ class MultiHeadAttentionRoPE(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, rope_max_len: int = 5000):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        from positional import RotaryPositionalEmbedding  # local import to avoid a hard circular dep
+        from .positional import RotaryPositionalEmbedding  # local import to avoid a hard circular dep
 
         self.d_model = d_model
         self.n_heads = n_heads

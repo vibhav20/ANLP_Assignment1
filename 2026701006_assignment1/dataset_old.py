@@ -6,6 +6,12 @@ train/val/test with a fixed seed, trains TWO from-scratch BPE tokenizers
 (bpe_tokenizer.py) -- one on the cipher side, one on the plaintext side --
 and exposes a torch Dataset + collate_fn that produce padded batches
 compatible with transformer.py's Seq2SeqTransformer.
+
+IMPORTANT: tokenizers are trained ONLY on the train split, never on val/test.
+Training on the full corpus (including val/test lines) would leak
+information about held-out data into the vocabulary itself -- e.g. a merge
+rule that only exists because of a pattern in a test-set line. This keeps
+the evaluation honest.
 """
 
 import json
