@@ -12,6 +12,7 @@ No nn.Transformer / nn.MultiheadAttention used anywhere.
 import math
 import torch
 import torch.nn as nn
+from .positional import RotaryPositionalEmbedding
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -154,6 +155,59 @@ class GroupedQueryAttention(nn.Module):
 
         K = self._repeat_kv(K)  # (b, n_heads, sk, d_k)
         V = self._repeat_kv(V)  # (b, n_heads, sk, d_k)
+
+        attn_out, attn_weights = self.attention(Q, K, V, mask=mask)
+
+        merged = self._merge_heads(attn_out)
+        output = self.w_o(merged)
+        return output, attn_weights
+
+
+class MultiHeadAttentionRoPE(nn.Module):
+    """
+    Multi-Head Attention with RoPE applied to Q and K before SDPA, instead
+    of sinusoidal PE being added to the embeddings up front. Used by C2.
+
+    Structurally identical to MultiHeadAttention except for the rotation
+    step -- everything else (projections, head split/merge, output proj)
+    is unchanged, so this isolates RoPE's effect as the single swapped
+    component, per the ablation spec.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, rope_max_len: int = 5000):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        self.w_o = nn.Linear(d_model, d_model)
+
+        self.rope = RotaryPositionalEmbedding(self.d_k, max_len=rope_max_len)
+        self.attention = ScaledDotProductAttention(dropout=dropout)
+
+    def _split_heads(self, x):
+        batch, seq_len, _ = x.shape
+        x = x.view(batch, seq_len, self.n_heads, self.d_k)
+        return x.transpose(1, 2)
+
+    def _merge_heads(self, x):
+        batch, n_heads, seq_len, d_k = x.shape
+        x = x.transpose(1, 2).contiguous()
+        return x.view(batch, seq_len, n_heads * d_k)
+
+    def forward(self, query, key, value, mask=None):
+        Q = self._split_heads(self.w_q(query))
+        K = self._split_heads(self.w_k(key))
+        V = self._split_heads(self.w_v(value))
+
+        # rotate Q and K independently, using each side's own sequence
+        # length -- correct for cross-attention where query/key seq_lens differ
+        Q = self.rope.apply_rotary(Q, Q.size(2))
+        K = self.rope.apply_rotary(K, K.size(2))
 
         attn_out, attn_weights = self.attention(Q, K, V, mask=mask)
 

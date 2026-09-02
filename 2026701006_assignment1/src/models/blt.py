@@ -121,28 +121,23 @@ def make_patch_self_mask(patch_valid: torch.Tensor):
     pad = make_patch_padding_mask(patch_valid)  # (batch,1,1,P)
     return causal & pad
 
-
-def make_local_decoder_cross_mask(byte_patch_ids: torch.Tensor, patch_valid: torch.Tensor):
-    """
-    For the LOCAL byte decoder's cross-attention into the global decoder's
-    patch latents: byte position i may only attend to patch latents at
-    index <= byte_patch_ids[b, i] -- its own (precomputed) patch and
-    earlier ones. Uses the ACTUAL per-byte patch assignment tensor, so it
-    works identically whether patch_ids came from a fixed-width or a
-    dynamic scheme.
-    Returns: (batch, 1, byte_len, num_patches) bool.
-    """
+def make_local_decoder_cross_mask(byte_patch_ids, patch_valid):
     batch, byte_len = byte_patch_ids.shape
     num_patches = patch_valid.size(1)
     device = byte_patch_ids.device
 
-    patch_range = torch.arange(num_patches, device=device).view(1, 1, -1)         # (1,1,P)
-    causal_byte_to_patch = (patch_range <= byte_patch_ids.unsqueeze(-1))          # (batch,byte_len,P)
-    causal_byte_to_patch = causal_byte_to_patch.unsqueeze(1)                      # (batch,1,byte_len,P)
+    patch_range = torch.arange(num_patches, device=device).view(1, 1, -1)
+    causal_byte_to_patch = (patch_range < byte_patch_ids.unsqueeze(-1))
 
-    pad = make_patch_padding_mask(patch_valid)  # (batch,1,1,P)
-    return causal_byte_to_patch & pad  # broadcasts -> (batch,1,byte_len,P)
+    # patch-0 bytes have no strictly-earlier patch -- fall back to their
+    # own patch instead of leaving an all-False (NaN-softmax) row
+    no_earlier_patch = ~causal_byte_to_patch.any(dim=-1, keepdim=True)
+    own_patch = (patch_range == byte_patch_ids.unsqueeze(-1))
+    causal_byte_to_patch = causal_byte_to_patch | (no_earlier_patch & own_patch)
 
+    causal_byte_to_patch = causal_byte_to_patch.unsqueeze(1)
+    pad = make_patch_padding_mask(patch_valid)
+    return causal_byte_to_patch & pad
 
 def build_patch_membership(byte_ids: torch.Tensor, patch_ids: torch.Tensor, pad_id: int = PAD_BYTE):
     """
@@ -429,16 +424,23 @@ if __name__ == "__main__":
 
     logits_a = model(src, src_patch_ids, tgt_in, tgt_patch_ids)
     logits_b = model(src, src_patch_ids, tgt_in2, tgt_patch_ids)
+
     last_byte_patch = tgt_patch_ids[0, -1].item()
     earlier_positions = (tgt_patch_ids[0] < last_byte_patch).nonzero(as_tuple=True)[0]
     if len(earlier_positions) > 0:
         cutoff = earlier_positions[-1].item() + 1
+
+        # --- add these three lines here, before the assert ---
+        torch.set_printoptions(precision=10)
+        max_diff_early = (logits_a[:, :cutoff, :] - logits_b[:, :cutoff, :]).abs().max()
+        print("Max diff over 'earlier' region (full precision):", max_diff_early.item())
+        # --------------------------------------------------------
+
         assert torch.allclose(logits_a[:, :cutoff, :], logits_b[:, :cutoff, :], atol=1e-5), \
             "causal leak: earlier patches changed when a later byte was perturbed"
         print("Causal masking (no future leakage across patches) check passed")
     else:
         print("Skipping leakage check (perturbed byte's patch is the first patch)")
-
     # --- tiny-batch overfit check using fixed-width patching end-to-end ---
     print("\nRunning tiny-batch overfit check (fixed-width patching)...")
     torch.manual_seed(1)
