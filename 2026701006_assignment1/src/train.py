@@ -10,6 +10,10 @@ Run on Colab as:
     metrics = run_config("C1", train_loader, val_loader, test_loader,
                           src_tok, tgt_tok, epochs=10)
 
+    from train import run_config_c5
+    metrics = run_config_c5(byte_train_loader, byte_val_loader,
+                             byte_test_loader, patch_size, epochs=10)
+
 Or loop over all four configs -- see the __main__ block at the bottom for
 the exact orchestration pattern to paste into a Colab cell.
 """
@@ -20,8 +24,16 @@ import torch.nn as nn
 import wandb
 from huggingface_hub import HfApi
 
-from .transformer import build_model, make_padding_mask, make_decoder_self_mask
+from .transformer import build_model, make_padding_mask, make_decoder_self_mask, make_causal_mask
 from .utils import compute_all_metrics
+
+from .models.blt import (
+    BOS_BYTE, EOS_BYTE, PAD_BYTE, BYTE_VOCAB_SIZE,
+    byte_ids_to_text, BLTSeq2Seq,
+    compute_fixed_patch_boundaries,
+    make_patch_padding_mask, make_patch_self_mask, make_local_decoder_cross_mask,
+)
+ 
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -160,6 +172,223 @@ def push_checkpoint(model, config_name, epoch, hf_repo_id, local_dir="/tmp/ckpt"
     )
     print(f"  pushed checkpoint -> {hf_repo_id}/{config_name}/checkpoint_latest.pt (epoch {epoch})")
 
+ 
+# ---------------------------------------------------------------------------
+# C5 (BLT): byte-level greedy decoding and training loop.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def greedy_decode_batch_blt(model, src, src_patch_ids, patch_size=4, max_len=2000):
+    """
+    Byte-by-byte greedy generation for BLTSeq2Seq with FIXED-WIDTH patching.
+ 
+    Source-side patch ids are already fixed at data-loading time
+    (src_patch_ids, passed straight through). Target-side patch ids are
+    recomputed at every decoding step with the SAME rule dataset.py uses
+    (compute_fixed_patch_boundaries) -- since patch membership depends only
+    on byte POSITION, not content, there's no entropy model / n-gram state
+    to carry across steps (unlike the dynamic-patching version). Because
+    every example in the batch is padded to the same `generated` length at
+    each step, the target patch-id row is identical across the whole batch
+    and only needs to be computed once, then broadcast.
+ 
+    Returns: list[str] decoded plaintext, one per example in the batch.
+    """
+    model.eval()
+    batch_size = src.size(0)
+ 
+    src_patch_emb, src_patch_valid = model.src_local_encoder(src, src_patch_ids)
+    src_patch_mask = make_patch_padding_mask(src_patch_valid)
+    enc_out = model.global_encoder(src_patch_emb, src_patch_mask)
+ 
+    generated = torch.full((batch_size, 1), BOS_BYTE, dtype=torch.long, device=src.device)
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=src.device)
+ 
+    for _ in range(max_len):
+        cur_len = generated.size(1)
+        patch_ids_row = compute_fixed_patch_boundaries(cur_len, patch_size=patch_size)
+        patch_ids_tensor = torch.tensor(patch_ids_row, dtype=torch.long, device=src.device) \
+            .unsqueeze(0).expand(batch_size, -1)
+ 
+        tgt_patch_emb, tgt_patch_valid = model.tgt_local_encoder(generated, patch_ids_tensor)
+        tgt_patch_self_mask = make_patch_self_mask(tgt_patch_valid)
+        dec_patch_out = model.global_decoder(tgt_patch_emb, enc_out,
+                                              self_mask=tgt_patch_self_mask,
+                                              cross_mask=src_patch_mask)
+ 
+        local_self_mask = make_causal_mask(cur_len, device=generated.device) & \
+            make_padding_mask(generated, model.pad_id)
+        local_cross_mask = make_local_decoder_cross_mask(patch_ids_tensor, tgt_patch_valid)
+ 
+        logits = model.local_decoder(generated, dec_patch_out,
+                                      self_mask=local_self_mask, cross_mask=local_cross_mask)
+ 
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = torch.where(finished.unsqueeze(1),
+                                  torch.full_like(next_token, EOS_BYTE), next_token)
+        generated = torch.cat([generated, next_token], dim=1)
+ 
+        finished = finished | (next_token.squeeze(1) == EOS_BYTE)
+        if finished.all():
+            break
+ 
+    return [byte_ids_to_text(seq.tolist()) for seq in generated]
+ 
+ 
+@torch.no_grad()
+def evaluate_metrics_blt(model, loader, patch_size=4, max_gen_len=2000):
+    """
+    Same idea as evaluate_metrics, but for BLT: BLEU/ROUGE are excluded --
+    the spec restricts them to "tokenized models only". Also computes
+    bit-level accuracy on the UTF-8 bit representation of predicted vs.
+    target plaintext, since there's no subword granularity for C5.
+ 
+    `patch_size` is the SAME fixed-width value used to build the loaders
+    (dataset.build_byte_datasets()'s return value) -- passed straight
+    through to greedy_decode_batch_blt so target-side patch ids during
+    generation are computed with the identical rule used at training time.
+    """
+    model.eval()
+    all_preds, all_targets, pred_bits, target_bits = [], [], [], []
+ 
+    def text_to_bits(s):
+        return "".join(format(b, "08b") for b in s.encode("utf-8"))
+ 
+    for batch in loader:
+        src = batch["src"].to(DEVICE)
+        src_patch_ids = batch["src_patch_ids"].to(DEVICE)
+        tgt_labels = batch["tgt_labels"]
+ 
+        preds = greedy_decode_batch_blt(model, src, src_patch_ids,
+                                         patch_size=patch_size, max_len=max_gen_len)
+        targets = [byte_ids_to_text(seq.tolist()) for seq in tgt_labels]
+ 
+        all_preds.extend(preds)
+        all_targets.extend(targets)
+        pred_bits.extend(text_to_bits(p) for p in preds)
+        target_bits.extend(text_to_bits(t) for t in targets)
+ 
+    return compute_all_metrics(all_preds, all_targets,
+                                pred_bits_list=pred_bits, target_bits_list=target_bits,
+                                include_bleu_rouge=False)
+ 
+ 
+def run_config_c5(train_loader, val_loader, test_loader, patch_size,
+                   epochs=10, lr=3e-4, d_model=128, n_heads=4, d_ff=512,
+                   n_local_layers=2, n_global_enc_layers=3, n_global_dec_layers=3, dropout=0.1,
+                   wandb_project="anlp-a1-ablation", hf_repo_id=None,
+                   checkpoint_every=1, max_gen_len=2000):
+    """
+    Mirrors run_config's structure (build -> train -> log -> checkpoint ->
+    greedy-decode eval) but for BLTSeq2Seq with FIXED-WIDTH patching.
+    `patch_size` comes directly from dataset.build_byte_datasets()'s return
+    value -- always reuse the SAME patch_size the loaders were built with,
+    since it also drives target-side patch-id recomputation during greedy
+    decoding (see greedy_decode_batch_blt). Unlike the entropy-based
+    version, there's no trained n-gram model or threshold to thread
+    through here -- fixed patching needs no extra state at all.
+    """
+    config_name = "C5"
+    print(f"\n{'='*60}\nRunning {config_name} (BLT, fixed-width patching) on {DEVICE}\n{'='*60}")
+ 
+    model = BLTSeq2Seq(
+        d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+        n_local_layers=n_local_layers, n_global_enc_layers=n_global_enc_layers,
+        n_global_dec_layers=n_global_dec_layers, dropout=dropout,
+    ).to(DEVICE)
+ 
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_BYTE)
+ 
+    run = wandb.init(project=wandb_project, name=config_name, reinit=True,
+                      config={
+                          "config_name": config_name, "epochs": epochs, "lr": lr,
+                          "d_model": d_model, "n_heads": n_heads, "d_ff": d_ff,
+                          "n_local_layers": n_local_layers,
+                          "n_global_enc_layers": n_global_enc_layers,
+                          "n_global_dec_layers": n_global_dec_layers,
+                          "vocab_size": BYTE_VOCAB_SIZE,
+                          "patch_size": patch_size,
+                      })
+ 
+    global_step = 0
+    t0 = time.time()
+    peak_mem_mb = 0.0
+    train_loss, val_loss = 0.0, 0.0
+ 
+    for epoch in range(epochs):
+        model.train()
+        total_loss, n_batches = 0.0, 0
+        for batch in train_loader:
+            src = batch["src"].to(DEVICE)
+            src_patch_ids = batch["src_patch_ids"].to(DEVICE)
+            tgt_in = batch["tgt_in"].to(DEVICE)
+            tgt_in_patch_ids = batch["tgt_in_patch_ids"].to(DEVICE)
+            tgt_labels = batch["tgt_labels"].to(DEVICE)
+ 
+            # patch_ids for both src and tgt come straight from the collate
+            # fn (precomputed once via compute_fixed_patch_boundaries in
+            # dataset.py) -- model output length == tgt_in length exactly,
+            # so labels need no extra alignment step.
+            optimizer.zero_grad()
+            logits = model(src, src_patch_ids, tgt_in, tgt_in_patch_ids)
+            loss = criterion(logits.reshape(-1, BYTE_VOCAB_SIZE), tgt_labels.reshape(-1))
+            loss.backward()
+            optimizer.step()
+ 
+            total_loss += loss.item()
+            n_batches += 1
+            global_step += 1
+            if global_step % 50 == 0:
+                run.log({"train/loss_step": loss.item(), "epoch": epoch}, step=global_step)
+ 
+        train_loss = total_loss / max(n_batches, 1)
+ 
+        model.eval()
+        val_total, val_n = 0.0, 0
+        with torch.no_grad():
+            for batch in val_loader:
+                src = batch["src"].to(DEVICE)
+                src_patch_ids = batch["src_patch_ids"].to(DEVICE)
+                tgt_in = batch["tgt_in"].to(DEVICE)
+                tgt_in_patch_ids = batch["tgt_in_patch_ids"].to(DEVICE)
+                tgt_labels = batch["tgt_labels"].to(DEVICE)
+ 
+                logits = model(src, src_patch_ids, tgt_in, tgt_in_patch_ids)
+                loss = criterion(logits.reshape(-1, BYTE_VOCAB_SIZE), tgt_labels.reshape(-1))
+                val_total += loss.item()
+                val_n += 1
+        val_loss = val_total / max(val_n, 1)
+ 
+        if DEVICE.type == "cuda":
+            peak_mem_mb = max(peak_mem_mb, torch.cuda.max_memory_allocated() / 1e6)
+ 
+        run.log({"epoch": epoch, "train/loss_epoch": train_loss, "val/loss_epoch": val_loss,
+                  "peak_gpu_mem_mb": peak_mem_mb}, step=global_step)
+        print(f"[{config_name}] epoch {epoch+1}/{epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+ 
+        if hf_repo_id is not None and (epoch + 1) % checkpoint_every == 0:
+            push_checkpoint(model, config_name, epoch + 1, hf_repo_id)
+ 
+    train_time_sec = time.time() - t0
+ 
+    if hf_repo_id is not None:
+        push_checkpoint(model, config_name, epochs, hf_repo_id)
+ 
+    print(f"[{config_name}] running greedy-decode evaluation on test set (this is slower than "
+          f"C1-C4's decoding -- see the note in greedy_decode_batch_blt)...")
+    test_metrics = evaluate_metrics_blt(model, test_loader, patch_size=patch_size, max_gen_len=max_gen_len)
+    test_metrics["train_time_sec"] = train_time_sec
+    test_metrics["peak_gpu_mem_mb"] = peak_mem_mb
+    test_metrics["final_train_loss"] = train_loss
+    test_metrics["final_val_loss"] = val_loss
+ 
+    run.log({f"test/{k}": v for k, v in test_metrics.items()})
+    print(f"[{config_name}] test metrics: {test_metrics}")
+ 
+    run.finish()
+    return test_metrics
+ 
+
 
 # ---------------------------------------------------------------------------
 # Top-level: train + evaluate + log one config
@@ -278,6 +507,28 @@ if __name__ == "__main__":
             checkpoint_every=2,
         )
 
+    print("\n\n=== Summary across all configs ===")
+    for cfg, metrics in all_results.items():
+        print(cfg, metrics)
+
+    from .dataset import build_byte_datasets
+ 
+    byte_train_loader, byte_val_loader, byte_test_loader, patch_size = build_byte_datasets(
+        cipher_path="brown_cipher.txt",
+        plain_path="brown_plain.txt",
+        split_save_path="splits_c5.json",
+        batch_size=32,
+        patch_size=4,
+    )
+ 
+    all_results["C5"] = run_config_c5(
+        byte_train_loader, byte_val_loader, byte_test_loader, patch_size,
+        epochs=10, lr=3e-4, d_model=128, n_heads=4, d_ff=512,
+        n_local_layers=2, n_global_enc_layers=3, n_global_dec_layers=3, dropout=0.1,
+        wandb_project="anlp-a1-ablation", hf_repo_id=HF_REPO_ID,
+        checkpoint_every=2,
+    )
+ 
     print("\n\n=== Summary across all configs ===")
     for cfg, metrics in all_results.items():
         print(cfg, metrics)
