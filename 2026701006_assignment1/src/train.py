@@ -20,8 +20,8 @@ import torch.nn as nn
 import wandb
 from huggingface_hub import HfApi
 
-from transformer import build_model, make_padding_mask, make_decoder_self_mask
-from utils import compute_all_metrics
+from .transformer import build_model, make_padding_mask, make_decoder_self_mask
+from .utils import compute_all_metrics
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -255,7 +255,7 @@ if __name__ == "__main__":
     # Paste-into-Colab orchestration pattern for running all of C1-C4.
     # Assumes dataset.py's build_datasets() has already been called.
     # ---------------------------------------------------------------
-    from dataset import build_datasets
+    from .dataset import build_datasets
 
     train_loader, val_loader, test_loader, src_tok, tgt_tok = build_datasets(
         cipher_path="brown_cipher.txt",

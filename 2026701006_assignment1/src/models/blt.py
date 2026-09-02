@@ -45,10 +45,10 @@ from collections import defaultdict, Counter
 import torch
 import torch.nn as nn
 
-from attention import MultiHeadAttention
-from positional import SinusoidalPositionalEncoding
-from norm import LayerNorm
-from transformer import EncoderLayer, DecoderLayer, make_padding_mask, make_causal_mask
+from .attention import MultiHeadAttention
+from .positional import SinusoidalPositionalEncoding
+from .norm import LayerNorm
+from ..transformer import EncoderLayer, DecoderLayer, make_padding_mask, make_causal_mask
 
 
 # ---------------------------------------------------------------------------

@@ -18,9 +18,9 @@ import math
 import torch
 import torch.nn as nn
 
-from models.attention import MultiHeadAttention, MultiHeadAttentionRoPE, GroupedQueryAttention
-from models.positional import SinusoidalPositionalEncoding
-from models.norm import LayerNorm, RMSNorm
+from .models.attention import MultiHeadAttention, MultiHeadAttentionRoPE, GroupedQueryAttention
+from .models.positional import SinusoidalPositionalEncoding
+from .models.norm import LayerNorm, RMSNorm
 
 
 # ---------------------------------------------------------------------------

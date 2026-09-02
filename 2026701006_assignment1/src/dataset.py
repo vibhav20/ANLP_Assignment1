@@ -21,8 +21,8 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from bpe_tokenizer import BPETokenizer
-from models.blt import (
+from .bpe_tokenizer import BPETokenizer
+from .models.blt import (
     bits_to_byte_ids, text_to_byte_ids, PAD_BYTE, BYTE_VOCAB_SIZE,
     ByteNgramEntropyModel, estimate_entropy_threshold, compute_patch_boundaries,
 )
@@ -406,7 +406,7 @@ if __name__ == "__main__":
     print(f"\nExample decoded target: {decoded_tgt!r}")
 
     # --- wire into the actual Seq2SeqTransformer to confirm end-to-end compatibility ---
-    from transformer import Seq2SeqTransformer
+    from .transformer import Seq2SeqTransformer
 
     model = Seq2SeqTransformer(
         src_vocab_size=src_tok.vocab_size,
@@ -444,7 +444,7 @@ if __name__ == "__main__":
     example_patch_sizes = list(_Counter(byte_batch["tgt_in_patch_ids"][0].tolist()).values())
     print(f"Example patch sizes within one line: {example_patch_sizes}")
 
-    from models.blt import byte_ids_to_text, BLTSeq2Seq
+    from .models.blt import byte_ids_to_text, BLTSeq2Seq
     byte_ex = byte_train_loader.dataset[0]
     byte_decoded = byte_ids_to_text(byte_ex["tgt_ids"])
     print(f"Example decoded target (byte loader): {byte_decoded!r}")
