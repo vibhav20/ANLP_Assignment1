@@ -8,12 +8,7 @@ Assembles C1 (base config): full Encoder-Decoder Transformer using
 - Standard subword tokenization (handled in dataset.py, not here)
 
 Pre-LN architecture throughout: x = x + Sublayer(Norm(x))
-
-In the real project this file lives at src/models/transformer.py and imports
-via `from .attention import MultiHeadAttention` etc. Here (scratch/testing
-dir) it imports directly since all files are siblings.
 """
-
 import math
 import torch
 import torch.nn as nn
@@ -29,8 +24,6 @@ from .models.norm import LayerNorm, RMSNorm
 class PositionwiseFeedForward(nn.Module):
     """
     FFN(x) = Linear2(Activation(Linear1(x)))
-    Applied independently to each position -- no mixing across seq_len here,
-    that's attention's job.
     """
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
@@ -84,15 +77,6 @@ def make_decoder_self_mask(tgt_seq, pad_idx):
 # Encoder
 # ---------------------------------------------------------------------------
 class EncoderLayer(nn.Module):
-    """
-    Pre-LN: x = x + SelfAttn(Norm(x)); x = x + FFN(Norm(x))
-
-    attention_factory: callable(d_model, n_heads, dropout) -> attention module.
-        Lets C1 pass MultiHeadAttention, C2 pass MultiHeadAttentionRoPE,
-        C3 pass GroupedQueryAttention (via functools.partial with n_kv_heads
-        pre-bound), without EncoderLayer needing to know which.
-    norm_cls: LayerNorm (C1/C2/C3) or RMSNorm (C4).
-    """
 
     def __init__(self, d_model, n_heads, d_ff, dropout=0.0,
                  attention_factory=None, norm_cls=LayerNorm):
@@ -145,7 +129,7 @@ class Encoder(nn.Module):
         """
         src: (batch, src_len) token ids
         """
-        x = self.embedding(src) * math.sqrt(self.d_model)  # scale, as in the original paper
+        x = self.embedding(src) * math.sqrt(self.d_model) 
         if self.use_sinusoidal_pe:
             x = self.pos_encoding(x)
 
@@ -170,10 +154,6 @@ class DecoderLayer(nn.Module):
         attention_factory = attention_factory or (
             lambda d_model, n_heads, dropout: MultiHeadAttention(d_model, n_heads, dropout=dropout)
         )
-        # cross-attention always stays standard MHA, even for C2/C3 --
-        # the ablation swaps SELF-attention's mechanism; cross-attention
-        # (queries into a different sequence) keeps the base config's
-        # cross-attention behavior so only one thing changes per Table 1.
         self.self_attn = attention_factory(d_model, n_heads, dropout)
         self.cross_attn = MultiHeadAttention(d_model, n_heads, dropout=dropout)
         self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout=dropout)
@@ -281,7 +261,7 @@ class Seq2SeqTransformer(nn.Module):
         return logits
 
 
-VALID_CONFIGS = {"C1", "C2", "C3", "C4"}  # C5 (BLT) is a separate model class, not built here
+VALID_CONFIGS = {"C1", "C2", "C3", "C4"}  # C5 (BLT) is built seperately
 
 
 def build_model(config_name, src_vocab_size, tgt_vocab_size,
@@ -289,14 +269,6 @@ def build_model(config_name, src_vocab_size, tgt_vocab_size,
                  n_enc_layers=3, n_dec_layers=3, max_len=5000, dropout=0.1,
                  src_pad_idx=0, tgt_pad_idx=0, n_kv_heads=2):
     """
-    Builds one of C1-C4 from Table 1, changing exactly the ONE component
-    each config specifies, with every other hyperparameter identical.
-
-        C1: sinusoidal PE, MHA,           LayerNorm  (base)
-        C2: RoPE,           MHA,           LayerNorm
-        C3: sinusoidal PE,  GQA,           LayerNorm
-        C4: sinusoidal PE,  MHA,           RMSNorm
-
     n_kv_heads only matters for C3 (GQA) -- must divide n_heads evenly.
     """
     assert config_name in VALID_CONFIGS, f"build_model handles {VALID_CONFIGS}, got {config_name!r}"
@@ -328,75 +300,3 @@ def build_model(config_name, src_vocab_size, tgt_vocab_size,
         attention_factory=attention_factory, norm_cls=norm_cls,
         use_sinusoidal_pe=use_sinusoidal_pe,
     )
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-
-    # ---- shape sanity check ----
-    src_vocab, tgt_vocab = 256, 100  # e.g. byte vocab for cipher, small subword vocab for plaintext
-    batch, src_len, tgt_len = 4, 12, 10
-    d_model, n_heads, d_ff = 32, 4, 64
-
-    model = Seq2SeqTransformer(
-        src_vocab_size=src_vocab, tgt_vocab_size=tgt_vocab,
-        d_model=d_model, n_heads=n_heads, d_ff=d_ff,
-        n_enc_layers=2, n_dec_layers=2, dropout=0.0,
-    )
-
-    src = torch.randint(1, src_vocab, (batch, src_len))  # avoid 0 = pad_idx for this check
-    tgt = torch.randint(1, tgt_vocab, (batch, tgt_len))
-
-    logits = model(src, tgt)
-    assert logits.shape == (batch, tgt_len, tgt_vocab)
-    print("Full model shape check passed:", logits.shape)
-
-    # ---- causal masking check: changing a FUTURE tgt token shouldn't change
-    #      logits at an EARLIER position (teacher-forcing correctness) ----
-    tgt2 = tgt.clone()
-    tgt2[:, -1] = (tgt2[:, -1] + 1) % tgt_vocab  # perturb only the last position
-
-    logits_orig = model(src, tgt)
-    logits_pert = model(src, tgt2)
-
-    # all positions except the last should be identical
-    assert torch.allclose(logits_orig[:, :-1, :], logits_pert[:, :-1, :], atol=1e-5), \
-        "causal mask leak: earlier positions changed when a later token was perturbed"
-    print("Causal masking (no future leakage) check passed")
-
-    # ---- tiny-batch overfit check (synthetic data, gate check for the architecture) ----
-    print("\nRunning tiny-batch overfit check...")
-    torch.manual_seed(1)
-
-    small_batch, small_src_len, small_tgt_len = 8, 10, 8
-    PAD_IDX = 0
-
-    toy_src = torch.randint(1, src_vocab, (small_batch, small_src_len))
-    toy_tgt_full = torch.randint(1, tgt_vocab, (small_batch, small_tgt_len + 1))
-    # decoder input = shifted right (drop last), labels = shifted left (drop first)
-    toy_tgt_in = toy_tgt_full[:, :-1]
-    toy_tgt_labels = toy_tgt_full[:, 1:]
-
-    overfit_model = Seq2SeqTransformer(
-        src_vocab_size=src_vocab, tgt_vocab_size=tgt_vocab,
-        d_model=64, n_heads=4, d_ff=256,
-        n_enc_layers=2, n_dec_layers=2, dropout=0.0,
-        src_pad_idx=PAD_IDX, tgt_pad_idx=PAD_IDX,
-    )
-    optimizer = torch.optim.Adam(overfit_model.parameters(), lr=3e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-
-    n_steps = 300
-    for step in range(n_steps):
-        optimizer.zero_grad()
-        logits = overfit_model(toy_src, toy_tgt_in)  # (batch, tgt_len, vocab)
-        loss = criterion(logits.reshape(-1, tgt_vocab), toy_tgt_labels.reshape(-1))
-        loss.backward()
-        optimizer.step()
-        if step % 50 == 0 or step == n_steps - 1:
-            print(f"  step {step:4d}  loss {loss.item():.4f}")
-
-    assert loss.item() < 0.1, f"tiny-batch overfit did not converge, final loss = {loss.item():.4f}"
-    print("Tiny-batch overfit check passed (architecture can learn).")
-
-    print("\nAll checks passed.")

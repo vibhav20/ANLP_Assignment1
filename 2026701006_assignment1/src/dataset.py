@@ -5,18 +5,169 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from .bpe_tokenizer import BPETokenizer
+# from .bpe_tokenizer import BPETokenizer
 from .models.blt import (
     bits_to_byte_ids, text_to_byte_ids, PAD_BYTE, BYTE_VOCAB_SIZE,
     compute_fixed_patch_boundaries,
 )
 
+import re
+from collections import Counter
 
-SEED = 42
-TRAIN_FRAC, VAL_FRAC = 0.8, 0.1  # remainder -> test
+# ---------------------------------------------------------------------------
+# BPE TOKENISER
+# ---------------------------------------------------------------------------
+PAD_TOKEN = "<pad>"
+BOS_TOKEN = "<bos>"
+EOS_TOKEN = "<eos>"
+UNK_TOKEN = "<unk>"
+SPECIAL_TOKENS = [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN]  # ids 0,1,2,3
+
+
+class BPETokenizer:
+
+    def __init__(self, num_merges: int = 500):
+        self.num_merges = num_merges
+        self.merges = []          # ordered list of (sym_a, sym_b) -> merged, in learned order
+        self.token_to_id = {}
+        self.id_to_token = {}
+
+    # -----------------------------------------------------------------
+    # Training
+    # -----------------------------------------------------------------
+    def _get_base_vocab(self, corpus):
+        """Every unique character appearing in the corpus."""
+        chars = set()
+        for line in corpus:
+            chars.update(line)
+        return sorted(chars)
+
+    def _word_to_symbols(self, word):
+        """Represent a line as a list of single-character symbols to start."""
+        return list(word)
+
+    def _get_pair_counts(self, corpus_symbols):
+        """Count frequency of every adjacent symbol pair across the corpus."""
+        pair_counts = Counter()
+        for symbols in corpus_symbols:
+            for i in range(len(symbols) - 1):
+                pair_counts[(symbols[i], symbols[i + 1])] += 1
+        return pair_counts
+
+    def _merge_pair(self, symbols, pair):
+        """Merge every occurrence of `pair` in a single symbol list."""
+        merged_symbol = pair[0] + pair[1]
+        new_symbols = []
+        i = 0
+        while i < len(symbols):
+            if i < len(symbols) - 1 and (symbols[i], symbols[i + 1]) == pair:
+                new_symbols.append(merged_symbol)
+                i += 2
+            else:
+                new_symbols.append(symbols[i])
+                i += 1
+        return new_symbols
+
+    def train(self, corpus):
+        """
+        Learns self.num_merges merge rules greedily by frequency.
+        """
+        base_vocab = self._get_base_vocab(corpus)
+
+        # working representation: each line as a list of symbols
+        corpus_symbols = [self._word_to_symbols(line) for line in corpus]
+
+        vocab = set(base_vocab)
+        merges = []
+
+        for _ in range(self.num_merges):
+            pair_counts = self._get_pair_counts(corpus_symbols)
+            if not pair_counts:
+                break  # nothing left to merge
+
+            best_pair, best_count = pair_counts.most_common(1)[0]
+            if best_count < 2:
+                break  # no more repeated patterns worth merging
+
+            corpus_symbols = [self._merge_pair(sym, best_pair) for sym in corpus_symbols]
+            merged_symbol = best_pair[0] + best_pair[1]
+            vocab.add(merged_symbol)
+            merges.append(best_pair)
+
+        self.merges = merges
+
+        # build final id mappings: special tokens first (fixed ids), then
+        # base chars, then merged symbols in the order they were learned
+        # (so the tokenizer is deterministic and reproducible)
+        ordered_vocab = list(SPECIAL_TOKENS) + list(base_vocab) + \
+            [a + b for (a, b) in merges]
+
+        seen = set()
+        final_vocab = []
+        for tok in ordered_vocab:
+            if tok not in seen:
+                seen.add(tok)
+                final_vocab.append(tok)
+
+        self.token_to_id = {tok: i for i, tok in enumerate(final_vocab)}
+        self.id_to_token = {i: tok for tok, i in self.token_to_id.items()}
+
+    # -----------------------------------------------------------------
+    # Encoding / Decoding
+    # -----------------------------------------------------------------
+    def _apply_merges(self, symbols):
+        """Apply learned merges IN LEARNED ORDER to a fresh symbol list."""
+        for pair in self.merges:
+            symbols = self._merge_pair(symbols, pair)
+        return symbols
+
+    def encode(self, text, add_bos_eos=True):
+        """
+        text: a single raw string (one line).
+        Returns: list of token ids.
+        """
+        symbols = self._word_to_symbols(text)
+        symbols = self._apply_merges(symbols)
+
+        ids = [self.token_to_id.get(sym, self.token_to_id[UNK_TOKEN]) for sym in symbols]
+
+        if add_bos_eos:
+            ids = [self.token_to_id[BOS_TOKEN]] + ids + [self.token_to_id[EOS_TOKEN]]
+        return ids
+
+    def decode(self, ids, strip_special=True):
+        """
+        ids: list/tensor of token ids.
+        Returns: reconstructed string.
+        """
+        tokens = [self.id_to_token.get(int(i), UNK_TOKEN) for i in ids]
+        if strip_special:
+            tokens = [t for t in tokens if t not in SPECIAL_TOKENS]
+        return "".join(tokens)
+
+    @property
+    def vocab_size(self):
+        return len(self.token_to_id)
+
+    @property
+    def pad_id(self):
+        return self.token_to_id[PAD_TOKEN]
+
+    @property
+    def bos_id(self):
+        return self.token_to_id[BOS_TOKEN]
+
+    @property
+    def eos_id(self):
+        return self.token_to_id[EOS_TOKEN]
+
 # ---------------------------------------------------------------------------
 # Split
 # ---------------------------------------------------------------------------
+
+SEED = 42
+TRAIN_FRAC, VAL_FRAC = 0.8, 0.1  # remainder -> test
+
 def load_lines(path):
     with open(path, "r", encoding="utf-8") as f:
         return [line.rstrip("\n") for line in f]
@@ -158,7 +309,7 @@ def build_datasets(cipher_path, plain_path, split_save_path=None,
 # ---------------------------------------------------------------------------
 class BytePairDataset(Dataset):
     """
-    Holds precomputed byte ids AND their precomputed patch ids -- patch
+    Holds precomputed byte ids AND their precomputed patch ids patch
     assignment is computed ONCE per line here, not recomputed every epoch.
     """
  
@@ -183,11 +334,7 @@ class BytePairDataset(Dataset):
  
 def make_byte_collate_fn(pad_id=PAD_BYTE):
     """
-    Pads byte_ids with pad_id as usual. patch_ids are padded by REPEATING
-    each sequence's last real patch id -- the exact value doesn't affect
-    correctness (padding positions are excluded via the byte-validity
-    check inside build_patch_membership regardless), but repeating the
-    last id keeps patch indices in a sane, non-exploding range.
+    Pads byte_ids with pad_id 
     """
  
     def collate_fn(batch):
@@ -233,21 +380,8 @@ def build_byte_datasets(cipher_path, plain_path, split_save_path=None,
                          patch_size=4):
     """
     Simplified (fixed-width patching) version of the C5 byte-level loader.
-    No entropy model, no n-gram training, no threshold estimation -- byte i
-    is assigned to patch i // patch_size for both src and tgt. This is a
-    valid simplification per the relaxed C5 patching requirement; the rest
-    of the pipeline (BLTSeq2Seq, LocalEncoder's membership-based pooling,
-    the global transformer, LocalDecoder's patch-causal cross-attention)
-    is unchanged and agnostic to how patch_ids were derived.
- 
     Returns:
         train_loader, val_loader, test_loader, patch_size
- 
-    `patch_size` is returned so train.py's greedy decoding can recompute
-    the target side's patch assignment incrementally with the SAME rule
-    used here (call compute_fixed_patch_boundaries(len_so_far, patch_size)
-    after each generated byte -- no trained model/state to carry around,
-    unlike the entropy version).
     """
     cipher_lines = load_lines(cipher_path)
     plain_lines = load_lines(plain_path)

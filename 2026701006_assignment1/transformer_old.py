@@ -18,9 +18,9 @@ import math
 import torch
 import torch.nn as nn
 
-from attention import MultiHeadAttention
-from positional import SinusoidalPositionalEncoding
-from norm import LayerNorm
+from .models.attention import MultiHeadAttention, MultiHeadAttentionRoPE, GroupedQueryAttention
+from .models.positional import SinusoidalPositionalEncoding
+from .models.norm import LayerNorm, RMSNorm
 
 
 # ---------------------------------------------------------------------------
@@ -86,14 +86,24 @@ def make_decoder_self_mask(tgt_seq, pad_idx):
 class EncoderLayer(nn.Module):
     """
     Pre-LN: x = x + SelfAttn(Norm(x)); x = x + FFN(Norm(x))
+
+    attention_factory: callable(d_model, n_heads, dropout) -> attention module.
+        Lets C1 pass MultiHeadAttention, C2 pass MultiHeadAttentionRoPE,
+        C3 pass GroupedQueryAttention (via functools.partial with n_kv_heads
+        pre-bound), without EncoderLayer needing to know which.
+    norm_cls: LayerNorm (C1/C2/C3) or RMSNorm (C4).
     """
 
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.0):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.0,
+                 attention_factory=None, norm_cls=LayerNorm):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout=dropout)
+        attention_factory = attention_factory or (
+            lambda d_model, n_heads, dropout: MultiHeadAttention(d_model, n_heads, dropout=dropout)
+        )
+        self.self_attn = attention_factory(d_model, n_heads, dropout)
         self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout=dropout)
-        self.norm1 = LayerNorm(d_model)
-        self.norm2 = LayerNorm(d_model)
+        self.norm1 = norm_cls(d_model)
+        self.norm2 = norm_cls(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -110,24 +120,34 @@ class EncoderLayer(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers,
-                 max_len=5000, dropout=0.0, pad_idx=0):
+                 max_len=5000, dropout=0.0, pad_idx=0,
+                 attention_factory=None, norm_cls=LayerNorm,
+                 use_sinusoidal_pe=True):
         super().__init__()
         self.pad_idx = pad_idx
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
-        self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len, dropout=dropout)
         self.d_model = d_model
 
+        # C2 (RoPE) rotates inside attention instead -- skip the additive
+        # sinusoidal PE in that case so position isn't encoded twice.
+        self.use_sinusoidal_pe = use_sinusoidal_pe
+        if use_sinusoidal_pe:
+            self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len, dropout=dropout)
+
         self.layers = nn.ModuleList([
-            EncoderLayer(d_model, n_heads, d_ff, dropout=dropout) for _ in range(n_layers)
+            EncoderLayer(d_model, n_heads, d_ff, dropout=dropout,
+                         attention_factory=attention_factory, norm_cls=norm_cls)
+            for _ in range(n_layers)
         ])
-        self.final_norm = LayerNorm(d_model)  # final norm after last Pre-LN layer
+        self.final_norm = norm_cls(d_model)  # final norm after last Pre-LN layer
 
     def forward(self, src, src_mask=None):
         """
         src: (batch, src_len) token ids
         """
         x = self.embedding(src) * math.sqrt(self.d_model)  # scale, as in the original paper
-        x = self.pos_encoding(x)
+        if self.use_sinusoidal_pe:
+            x = self.pos_encoding(x)
 
         for layer in self.layers:
             x = layer(x, src_mask=src_mask)
@@ -144,14 +164,22 @@ class DecoderLayer(nn.Module):
     Self-attention is causally masked; cross-attention is not.
     """
 
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.0):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.0,
+                 attention_factory=None, norm_cls=LayerNorm):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout=dropout)
+        attention_factory = attention_factory or (
+            lambda d_model, n_heads, dropout: MultiHeadAttention(d_model, n_heads, dropout=dropout)
+        )
+        # cross-attention always stays standard MHA, even for C2/C3 --
+        # the ablation swaps SELF-attention's mechanism; cross-attention
+        # (queries into a different sequence) keeps the base config's
+        # cross-attention behavior so only one thing changes per Table 1.
+        self.self_attn = attention_factory(d_model, n_heads, dropout)
         self.cross_attn = MultiHeadAttention(d_model, n_heads, dropout=dropout)
         self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout=dropout)
-        self.norm1 = LayerNorm(d_model)
-        self.norm2 = LayerNorm(d_model)
-        self.norm3 = LayerNorm(d_model)
+        self.norm1 = norm_cls(d_model)
+        self.norm2 = norm_cls(d_model)
+        self.norm3 = norm_cls(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -174,17 +202,24 @@ class DecoderLayer(nn.Module):
 
 class Decoder(nn.Module):
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers,
-                 max_len=5000, dropout=0.0, pad_idx=0):
+                 max_len=5000, dropout=0.0, pad_idx=0,
+                 attention_factory=None, norm_cls=LayerNorm,
+                 use_sinusoidal_pe=True):
         super().__init__()
         self.pad_idx = pad_idx
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
-        self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len, dropout=dropout)
         self.d_model = d_model
 
+        self.use_sinusoidal_pe = use_sinusoidal_pe
+        if use_sinusoidal_pe:
+            self.pos_encoding = SinusoidalPositionalEncoding(d_model, max_len, dropout=dropout)
+
         self.layers = nn.ModuleList([
-            DecoderLayer(d_model, n_heads, d_ff, dropout=dropout) for _ in range(n_layers)
+            DecoderLayer(d_model, n_heads, d_ff, dropout=dropout,
+                         attention_factory=attention_factory, norm_cls=norm_cls)
+            for _ in range(n_layers)
         ])
-        self.final_norm = LayerNorm(d_model)
+        self.final_norm = norm_cls(d_model)
         self.output_proj = nn.Linear(d_model, vocab_size)
 
     def forward(self, tgt, enc_out, self_mask=None, cross_mask=None):
@@ -193,7 +228,8 @@ class Decoder(nn.Module):
         enc_out: (batch, src_len, d_model)
         """
         x = self.embedding(tgt) * math.sqrt(self.d_model)
-        x = self.pos_encoding(x)
+        if self.use_sinusoidal_pe:
+            x = self.pos_encoding(x)
 
         for layer in self.layers:
             x = layer(x, enc_out, self_mask=self_mask, cross_mask=cross_mask)
@@ -209,7 +245,9 @@ class Decoder(nn.Module):
 class Seq2SeqTransformer(nn.Module):
     def __init__(self, src_vocab_size, tgt_vocab_size, d_model=128, n_heads=4,
                  d_ff=512, n_enc_layers=3, n_dec_layers=3, max_len=5000,
-                 dropout=0.1, src_pad_idx=0, tgt_pad_idx=0):
+                 dropout=0.1, src_pad_idx=0, tgt_pad_idx=0,
+                 attention_factory=None, norm_cls=LayerNorm,
+                 use_sinusoidal_pe=True):
         super().__init__()
         self.src_pad_idx = src_pad_idx
         self.tgt_pad_idx = tgt_pad_idx
@@ -217,10 +255,14 @@ class Seq2SeqTransformer(nn.Module):
         self.encoder = Encoder(
             src_vocab_size, d_model, n_heads, d_ff, n_enc_layers,
             max_len=max_len, dropout=dropout, pad_idx=src_pad_idx,
+            attention_factory=attention_factory, norm_cls=norm_cls,
+            use_sinusoidal_pe=use_sinusoidal_pe,
         )
         self.decoder = Decoder(
             tgt_vocab_size, d_model, n_heads, d_ff, n_dec_layers,
             max_len=max_len, dropout=dropout, pad_idx=tgt_pad_idx,
+            attention_factory=attention_factory, norm_cls=norm_cls,
+            use_sinusoidal_pe=use_sinusoidal_pe,
         )
 
     def forward(self, src, tgt):
@@ -237,6 +279,55 @@ class Seq2SeqTransformer(nn.Module):
         enc_out = self.encoder(src, src_mask=src_mask)
         logits = self.decoder(tgt, enc_out, self_mask=tgt_mask, cross_mask=cross_mask)
         return logits
+
+
+VALID_CONFIGS = {"C1", "C2", "C3", "C4"}  # C5 (BLT) is a separate model class, not built here
+
+
+def build_model(config_name, src_vocab_size, tgt_vocab_size,
+                 d_model=128, n_heads=4, d_ff=512,
+                 n_enc_layers=3, n_dec_layers=3, max_len=5000, dropout=0.1,
+                 src_pad_idx=0, tgt_pad_idx=0, n_kv_heads=2):
+    """
+    Builds one of C1-C4 from Table 1, changing exactly the ONE component
+    each config specifies, with every other hyperparameter identical.
+
+        C1: sinusoidal PE, MHA,           LayerNorm  (base)
+        C2: RoPE,           MHA,           LayerNorm
+        C3: sinusoidal PE,  GQA,           LayerNorm
+        C4: sinusoidal PE,  MHA,           RMSNorm
+
+    n_kv_heads only matters for C3 (GQA) -- must divide n_heads evenly.
+    """
+    assert config_name in VALID_CONFIGS, f"build_model handles {VALID_CONFIGS}, got {config_name!r}"
+
+    attention_factory = None  # None -> Seq2SeqTransformer defaults to plain MHA
+    norm_cls = LayerNorm
+    use_sinusoidal_pe = True
+
+    if config_name == "C2":
+        attention_factory = lambda d_model, n_heads, dropout: MultiHeadAttentionRoPE(
+            d_model, n_heads, dropout=dropout, rope_max_len=max_len
+        )
+        use_sinusoidal_pe = False  # RoPE replaces additive PE, don't apply both
+
+    elif config_name == "C3":
+        attention_factory = lambda d_model, n_heads, dropout: GroupedQueryAttention(
+            d_model, n_heads, n_kv_heads, dropout=dropout
+        )
+
+    elif config_name == "C4":
+        norm_cls = RMSNorm
+
+    return Seq2SeqTransformer(
+        src_vocab_size=src_vocab_size, tgt_vocab_size=tgt_vocab_size,
+        d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+        n_enc_layers=n_enc_layers, n_dec_layers=n_dec_layers,
+        max_len=max_len, dropout=dropout,
+        src_pad_idx=src_pad_idx, tgt_pad_idx=tgt_pad_idx,
+        attention_factory=attention_factory, norm_cls=norm_cls,
+        use_sinusoidal_pe=use_sinusoidal_pe,
+    )
 
 
 if __name__ == "__main__":

@@ -1,5 +1,11 @@
 """
-Runs on Colab as:
+train.py
+
+Trains one config (C1-C4) end-to-end: builds the model via
+transformer.build_model, trains with teacher forcing, evaluates with
+greedy decoding, logs to WandB, and pushes checkpoints to Hugging Face.
+
+Run on Colab as:
     from train import run_config
     metrics = run_config("C1", train_loader, val_loader, test_loader,
                           src_tok, tgt_tok, epochs=10)
@@ -7,6 +13,9 @@ Runs on Colab as:
     from train import run_config_c5
     metrics = run_config_c5(byte_train_loader, byte_val_loader,
                              byte_test_loader, patch_size, epochs=10)
+
+Or loop over all four configs -- see the __main__ block at the bottom for
+the exact orchestration pattern to paste into a Colab cell.
 """
 
 import time
@@ -171,6 +180,17 @@ def push_checkpoint(model, config_name, epoch, hf_repo_id, local_dir="/tmp/ckpt"
 def greedy_decode_batch_blt(model, src, src_patch_ids, patch_size=4, max_len=2000):
     """
     Byte-by-byte greedy generation for BLTSeq2Seq with FIXED-WIDTH patching.
+ 
+    Source-side patch ids are already fixed at data-loading time
+    (src_patch_ids, passed straight through). Target-side patch ids are
+    recomputed at every decoding step with the SAME rule dataset.py uses
+    (compute_fixed_patch_boundaries) -- since patch membership depends only
+    on byte POSITION, not content, there's no entropy model / n-gram state
+    to carry across steps (unlike the dynamic-patching version). Because
+    every example in the batch is padded to the same `generated` length at
+    each step, the target patch-id row is identical across the whole batch
+    and only needs to be computed once, then broadcast.
+ 
     Returns: list[str] decoded plaintext, one per example in the batch.
     """
     model.eval()
@@ -258,7 +278,14 @@ def run_config_c5(train_loader, val_loader, test_loader, patch_size,
                    wandb_project="anlp-a1-ablation", hf_repo_id=None,
                    checkpoint_every=1, max_gen_len=2000):
     """
-    Mirrors run_config's structure
+    Mirrors run_config's structure (build -> train -> log -> checkpoint ->
+    greedy-decode eval) but for BLTSeq2Seq with FIXED-WIDTH patching.
+    `patch_size` comes directly from dataset.build_byte_datasets()'s return
+    value -- always reuse the SAME patch_size the loaders were built with,
+    since it also drives target-side patch-id recomputation during greedy
+    decoding (see greedy_decode_batch_blt). Unlike the entropy-based
+    version, there's no trained n-gram model or threshold to thread
+    through here -- fixed patching needs no extra state at all.
     """
     config_name = "C5"
     print(f"\n{'='*60}\nRunning {config_name} (BLT, fixed-width patching) on {DEVICE}\n{'='*60}")
@@ -465,3 +492,58 @@ def run_config(config_name, train_loader, val_loader, test_loader,
 
     run.finish()
     return test_metrics
+
+
+if __name__ == "__main__":
+    # ---------------------------------------------------------------
+    # Paste-into-Colab orchestration pattern for running all of C1-C4.
+    # Assumes dataset.py's build_datasets() has already been called.
+    # ---------------------------------------------------------------
+    from .dataset import build_datasets
+
+    train_loader, val_loader, test_loader, src_tok, tgt_tok = build_datasets(
+        cipher_path="brown_cipher.txt",
+        plain_path="brown_plain.txt",
+        split_save_path="splits.json",
+        src_num_merges=500,
+        tgt_num_merges=500,
+        batch_size=32,
+    )
+
+    HF_REPO_ID = "<your-username>/anlp-a1-transformer"  # must already exist (create_repo done once)
+
+    all_results = {}
+    for config_name in ["C1", "C2", "C3", "C4"]:
+        all_results[config_name] = run_config(
+            config_name, train_loader, val_loader, test_loader, src_tok, tgt_tok,
+            epochs=10, lr=3e-4, d_model=128, n_heads=4, d_ff=512,
+            n_enc_layers=3, n_dec_layers=3, dropout=0.1, n_kv_heads=2,
+            wandb_project="anlp-a1-ablation", hf_repo_id=HF_REPO_ID,
+            checkpoint_every=2,
+        )
+
+    print("\n\n=== Summary across all configs ===")
+    for cfg, metrics in all_results.items():
+        print(cfg, metrics)
+
+    from .dataset import build_byte_datasets
+ 
+    byte_train_loader, byte_val_loader, byte_test_loader, patch_size = build_byte_datasets(
+        cipher_path="brown_cipher.txt",
+        plain_path="brown_plain.txt",
+        split_save_path="splits_c5.json",
+        batch_size=32,
+        patch_size=4,
+    )
+ 
+    all_results["C5"] = run_config_c5(
+        byte_train_loader, byte_val_loader, byte_test_loader, patch_size,
+        epochs=10, lr=3e-4, d_model=128, n_heads=4, d_ff=512,
+        n_local_layers=2, n_global_enc_layers=3, n_global_dec_layers=3, dropout=0.1,
+        wandb_project="anlp-a1-ablation", hf_repo_id=HF_REPO_ID,
+        checkpoint_every=2,
+    )
+ 
+    print("\n\n=== Summary across all configs ===")
+    for cfg, metrics in all_results.items():
+        print(cfg, metrics)

@@ -1,41 +1,3 @@
-"""
-blt.py
-
-Simplified Byte Latent Transformer (BLT) for C5 -- the token-free config.
-No vocabulary, no BPE: raw bytes in, raw bytes out.
-
-PATCHING: FIXED-WIDTH (simplified per the relaxed C5 requirement). Byte
-position i is assigned to patch i // patch_size. No entropy estimator, no
-n-gram training, no threshold. This is a frozen, non-differentiable
-PREPROCESSING step done once per line at data-loading time (see
-dataset.py), not inside the model's forward pass. The dynamic/entropy-based
-scheme is no longer required; fixed patching is a fully valid alternative
-as long as the overall simplified BLT pipeline (local encoder -> global
-transformer -> local decoder, with membership-based pooling and
-patch-causal masking) is retained -- and it is, unchanged, below.
-
-Pipeline:
-    raw source bytes + precomputed patch_ids
-        -> LocalEncoder (byte self-attention + membership-based
-                          cross-attention pooling into patches)
-        -> source patch representations
-        -> PatchEncoder (global transformer, patch-level self-attention)
-        -> encoded source patches
-    raw target bytes (teacher-forced input) + precomputed patch_ids
-        -> LocalEncoder (separate instance, target side, causal)
-        -> target patch representations
-        -> PatchDecoder (global transformer, causal patch-level self-attn
-                          + cross-attn to encoded source patches)
-        -> decoded target patch latents
-        -> LocalDecoder (causal byte self-attn + cross-attn to patch
-                          latents, patch-causality-masked using the
-                          ACTUAL per-byte patch assignment)
-        -> byte-level logits
-
-Reuses EncoderLayer / DecoderLayer / MultiHeadAttention / LayerNorm /
-SinusoidalPositionalEncoding as-is from the already-verified C1 modules.
-"""
-
 import math
 
 import torch
@@ -46,11 +8,9 @@ from .positional import SinusoidalPositionalEncoding
 from .norm import LayerNorm
 from ..transformer import EncoderLayer, DecoderLayer, make_padding_mask, make_causal_mask
 
-
 # ---------------------------------------------------------------------------
 # Byte-level vocabulary: raw bytes 0-255 plus 3 special ids outside that range.
-# Standard learned embedding over this vocabulary (nn.Embedding below) --
-# no n-gram hash embeddings, per the assignment clarification.
+# Standard learned embedding over this vocabulary (nn.Embedding below)
 # ---------------------------------------------------------------------------
 BOS_BYTE = 256
 EOS_BYTE = 257
@@ -61,8 +21,7 @@ BYTE_VOCAB_SIZE = 259
 def bits_to_byte_ids(bit_string: str):
     """
     Cipher line ('0'/'1' string, length % 8 == 0) -> [BOS, byte, ..., EOS].
-    Every 8 bits is grouped into ONE integer byte value (0-255) -- this is
-    the underlying binary data, not the text characters '0'/'1'.
+    Every 8 bits is grouped into ONE integer byte value (0-255) 
     """
     assert len(bit_string) % 8 == 0, "cipher bit length must be a multiple of 8"
     raw_bytes = [int(bit_string[i:i + 8], 2) for i in range(0, len(bit_string), 8)]
@@ -82,21 +41,8 @@ def byte_ids_to_text(ids):
 
 
 # ---------------------------------------------------------------------------
-# Patch boundaries: FIXED-WIDTH (simplified, per relaxed C5 requirement).
-#
-# This drops in with zero changes to the model code below (LocalEncoder,
-# build_patch_membership, make_patch_self_mask,
-# make_local_decoder_cross_mask, etc.) because all of those only ever
-# consume a per-byte, non-decreasing integer patch_ids sequence -- they
-# never inspect how it was derived.
 # ---------------------------------------------------------------------------
 def compute_fixed_patch_boundaries(seq_len: int, patch_size: int = 4):
-    """
-    seq_len: number of byte positions (including BOS/EOS) in this sequence.
-    patch_size: fixed number of bytes per patch (last patch may be shorter).
-    Returns: list[int], length seq_len, non-decreasing, e.g. patch_size=4 ->
-             [0,0,0,0, 1,1,1,1, 2,2,...]
-    """
     return [i // patch_size for i in range(seq_len)]
 
 
@@ -374,117 +320,3 @@ class BLTSeq2Seq(nn.Module):
         logits = self.local_decoder(tgt_byte_ids_in, dec_patch_out,
                                      self_mask=local_self_mask, cross_mask=local_cross_mask)
         return logits
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-
-    # --- byte conversion round-trip checks ---
-    text = "Hello, BLT!"
-    ids = text_to_byte_ids(text)
-    assert ids[0] == BOS_BYTE and ids[-1] == EOS_BYTE
-    assert byte_ids_to_text(ids) == text
-    print("text <-> byte_ids round-trip check passed")
-
-    bits = "".join(format(b, "08b") for b in text.encode("utf-8"))
-    cipher_ids = bits_to_byte_ids(bits)
-    assert cipher_ids[1:-1] == ids[1:-1]
-    print("bits_to_byte_ids groups 8 bits -> 1 byte value correctly")
-
-    # --- fixed-width patch boundaries sanity check ---
-    toy_seq = text_to_byte_ids("the cat sat on the mat")
-    patch_ids = compute_fixed_patch_boundaries(len(toy_seq), patch_size=4)
-    assert len(patch_ids) == len(toy_seq)
-    assert patch_ids == sorted(patch_ids)  # non-decreasing
-    num_patches = max(patch_ids) + 1
-    assert num_patches > 1
-    print(f"Fixed-width patch boundaries: {num_patches} patches over {len(patch_ids)} bytes -> {patch_ids}")
-
-    # --- shape check for the full model with fixed patch_ids ---
-    d_model, n_heads, d_ff = 32, 4, 64
-    batch, src_len, tgt_len = 3, 17, 13
-    patch_size = 4
-
-    model = BLTSeq2Seq(d_model=d_model, n_heads=n_heads, d_ff=d_ff,
-                        n_local_layers=1, n_global_enc_layers=1, n_global_dec_layers=1,
-                        dropout=0.0)
-
-    src = torch.randint(0, 256, (batch, src_len))
-    tgt_in = torch.randint(0, 256, (batch, tgt_len))
-    src_patch_ids = torch.tensor([compute_fixed_patch_boundaries(src_len, patch_size) for _ in range(batch)])
-    tgt_patch_ids = torch.tensor([compute_fixed_patch_boundaries(tgt_len, patch_size) for _ in range(batch)])
-
-    logits = model(src, src_patch_ids, tgt_in, tgt_patch_ids)
-    assert logits.shape == (batch, tgt_len, BYTE_VOCAB_SIZE), logits.shape
-    print("BLT (fixed patching) full model shape check passed:", logits.shape)
-
-    # --- causal correctness: perturbing a LATER byte must not change EARLIER logits ---
-    tgt_in2 = tgt_in.clone()
-    tgt_in2[:, -1] = (tgt_in2[:, -1] + 1) % 256
-
-    logits_a = model(src, src_patch_ids, tgt_in, tgt_patch_ids)
-    logits_b = model(src, src_patch_ids, tgt_in2, tgt_patch_ids)
-
-    last_byte_patch = tgt_patch_ids[0, -1].item()
-    earlier_positions = (tgt_patch_ids[0] < last_byte_patch).nonzero(as_tuple=True)[0]
-    if len(earlier_positions) > 0:
-        cutoff = earlier_positions[-1].item() + 1
-
-        # --- add these three lines here, before the assert ---
-        torch.set_printoptions(precision=10)
-        max_diff_early = (logits_a[:, :cutoff, :] - logits_b[:, :cutoff, :]).abs().max()
-        print("Max diff over 'earlier' region (full precision):", max_diff_early.item())
-        # --------------------------------------------------------
-
-        assert torch.allclose(logits_a[:, :cutoff, :], logits_b[:, :cutoff, :], atol=1e-5), \
-            "causal leak: earlier patches changed when a later byte was perturbed"
-        print("Causal masking (no future leakage across patches) check passed")
-    else:
-        print("Skipping leakage check (perturbed byte's patch is the first patch)")
-    # --- tiny-batch overfit check using fixed-width patching end-to-end ---
-    print("\nRunning tiny-batch overfit check (fixed-width patching)...")
-    torch.manual_seed(1)
-
-    toy_texts = ["the cat sat", "the dog ran", "a fox jumped",
-                 "birds fly high", "rain falls down", "wind blows hard"]
-    toy_tgt_seqs = [text_to_byte_ids(t) for t in toy_texts]
-    toy_src_seqs = [text_to_byte_ids(t[::-1]) for t in toy_texts]  # arbitrary distinct source
-
-    max_len = max(max(len(s) for s in toy_src_seqs), max(len(t) for t in toy_tgt_seqs))
-
-    def pad_and_patch(seqs, max_len, patch_size):
-        byte_batch, patch_batch = [], []
-        for seq in seqs:
-            p_ids = compute_fixed_patch_boundaries(len(seq), patch_size=patch_size)
-            pad_amt = max_len - len(seq)
-            byte_batch.append(seq + [PAD_BYTE] * pad_amt)
-            patch_batch.append(p_ids + [p_ids[-1]] * pad_amt)  # pad patch_ids with last real patch id
-        return torch.tensor(byte_batch, dtype=torch.long), torch.tensor(patch_batch, dtype=torch.long)
-
-    toy_src, toy_src_patch = pad_and_patch(toy_src_seqs, max_len, patch_size=4)
-    toy_tgt_full, toy_tgt_full_patch = pad_and_patch(toy_tgt_seqs, max_len, patch_size=4)
-
-    toy_tgt_in = toy_tgt_full[:, :-1]
-    toy_tgt_in_patch = toy_tgt_full_patch[:, :-1]
-    toy_tgt_labels = toy_tgt_full[:, 1:]
-
-    overfit_model = BLTSeq2Seq(d_model=64, n_heads=4, d_ff=256,
-                                n_local_layers=2, n_global_enc_layers=2, n_global_dec_layers=2,
-                                dropout=0.0)
-    optimizer = torch.optim.Adam(overfit_model.parameters(), lr=3e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_BYTE)
-
-    n_steps = 300
-    for step in range(n_steps):
-        optimizer.zero_grad()
-        logits = overfit_model(toy_src, toy_src_patch, toy_tgt_in, toy_tgt_in_patch)
-        loss = criterion(logits.reshape(-1, BYTE_VOCAB_SIZE), toy_tgt_labels.reshape(-1))
-        loss.backward()
-        optimizer.step()
-        if step % 50 == 0 or step == n_steps - 1:
-            print(f"  step {step:4d}  loss {loss.item():.4f}")
-
-    assert loss.item() < 0.3, f"BLT tiny-batch overfit did not converge, final loss = {loss.item():.4f}"
-    print("Tiny-batch overfit check passed (fixed-patching BLT architecture can learn).")
-
-    print("\nAll checks passed.")

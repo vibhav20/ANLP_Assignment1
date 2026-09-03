@@ -1,46 +1,4 @@
-"""
-blt.py
-
-Simplified Byte Latent Transformer (BLT) for C5 -- the token-free config.
-No vocabulary, no BPE: raw bytes in, raw bytes out.
-
-PATCHING: entropy-based and DYNAMIC, not fixed-width. A lightweight
-byte-level n-gram (Markov) model estimates next-byte entropy at every
-position; a new patch boundary starts wherever that estimated entropy
-exceeds a threshold (high entropy = the model is "surprised", i.e. novel/
-unpredictable content -- a natural place to start a new patch, per BLT's
-core idea). This is a frozen, non-differentiable PREPROCESSING step done
-once per line at data-loading time (see dataset.py), not inside the
-model's forward pass -- exactly mirroring how the original BLT paper uses
-a separately-trained entropy estimator decoupled from the main model's
-gradients. "Simplified" here means a plain n-gram model instead of a
-trained neural LM for entropy estimation -- the dynamic-boundary IDEA is
-retained, the scale of the estimator is what's cut down.
-
-Pipeline:
-    raw source bytes + precomputed patch_ids
-        -> LocalEncoder (byte self-attention + membership-based
-                          cross-attention pooling into DYNAMIC patches)
-        -> source patch representations
-        -> PatchEncoder (global transformer, patch-level self-attention)
-        -> encoded source patches
-    raw target bytes (teacher-forced input) + precomputed patch_ids
-        -> LocalEncoder (separate instance, target side, causal)
-        -> target patch representations
-        -> PatchDecoder (global transformer, causal patch-level self-attn
-                          + cross-attn to encoded source patches)
-        -> decoded target patch latents
-        -> LocalDecoder (causal byte self-attn + cross-attn to patch
-                          latents, patch-causality-masked using the
-                          ACTUAL per-byte patch assignment)
-        -> byte-level logits
-
-Reuses EncoderLayer / DecoderLayer / MultiHeadAttention / LayerNorm /
-SinusoidalPositionalEncoding as-is from the already-verified C1 modules.
-"""
-
 import math
-from collections import defaultdict, Counter
 
 import torch
 import torch.nn as nn
@@ -86,107 +44,22 @@ def byte_ids_to_text(ids):
 
 
 # ---------------------------------------------------------------------------
-# Lightweight byte-level n-gram (Markov) entropy estimator.
-# Pure counting, no gradients, no neural net -- runs on CPU trivially even
-# for thousands of lines. This is the "simplified" stand-in for BLT's
-# trained entropy LM: same purpose (score how surprising the next byte is
-# given recent context), much smaller mechanism.
+# Patch boundaries: FIXED-WIDTH (simplified, per relaxed C5 requirement).
+#
+# This drops in with zero changes to the model code below (LocalEncoder,
+# build_patch_membership, make_patch_self_mask,
+# make_local_decoder_cross_mask, etc.) because all of those only ever
+# consume a per-byte, non-decreasing integer patch_ids sequence -- they
+# never inspect how it was derived.
 # ---------------------------------------------------------------------------
-class ByteNgramEntropyModel:
+def compute_fixed_patch_boundaries(seq_len: int, patch_size: int = 4):
     """
-    order: how many preceding bytes form the conditioning context.
-    Trained via plain frequency counting on a corpus of byte-id sequences
-    (fit ONLY on the train split -- same leakage discipline as the BPE
-    tokenizers in dataset.py).
+    seq_len: number of byte positions (including BOS/EOS) in this sequence.
+    patch_size: fixed number of bytes per patch (last patch may be shorter).
+    Returns: list[int], length seq_len, non-decreasing, e.g. patch_size=4 ->
+             [0,0,0,0, 1,1,1,1, 2,2,...]
     """
-
-    def __init__(self, order: int = 3, vocab_size: int = BYTE_VOCAB_SIZE, smoothing: float = 1.0):
-        self.order = order
-        self.vocab_size = vocab_size
-        self.smoothing = smoothing
-        self.counts = defaultdict(Counter)   # context tuple -> Counter(next_byte -> count)
-        self.unigram_counts = Counter()
-        self.total_unigram = 0
-        self._dist_cache = {}                # memoized smoothed distributions per context
-
-    def train(self, sequences):
-        """sequences: list of list[int] (byte ids, including BOS/EOS)."""
-        for seq in sequences:
-            for i in range(len(seq)):
-                context = tuple(seq[max(0, i - self.order):i])
-                self.counts[context][seq[i]] += 1
-                self.unigram_counts[seq[i]] += 1
-                self.total_unigram += 1
-        self._dist_cache = {}  # invalidate cache if retrained
-
-    def _distribution(self, context):
-        """Returns a length-vocab_size probability list for P(next | context),
-        back-off to the unigram distribution for unseen contexts, with
-        additive (Laplace) smoothing throughout."""
-        if context in self._dist_cache:
-            return self._dist_cache[context]
-
-        counter = self.counts.get(context)
-        if not counter:
-            total = self.total_unigram + self.smoothing * self.vocab_size
-            probs = [(self.unigram_counts.get(v, 0) + self.smoothing) / total
-                     for v in range(self.vocab_size)]
-        else:
-            total = sum(counter.values()) + self.smoothing * self.vocab_size
-            probs = [(counter.get(v, 0) + self.smoothing) / total
-                     for v in range(self.vocab_size)]
-
-        self._dist_cache[context] = probs
-        return probs
-
-    def entropy_at(self, seq, i):
-        """Shannon entropy (bits) of P(seq[i] | seq[i-order:i])."""
-        context = tuple(seq[max(0, i - self.order):i])
-        probs = self._distribution(context)
-        return -sum(p * math.log2(p) for p in probs if p > 0)
-
-    def entropy_profile(self, seq):
-        """Returns list[float], one entropy value per position in seq."""
-        return [self.entropy_at(seq, i) for i in range(len(seq))]
-
-
-def estimate_entropy_threshold(entropy_model, sequences, quantile: float = 0.5):
-    """
-    Picks a global entropy threshold from the empirical distribution of
-    per-position entropies across a sample of sequences (default: median).
-    A boundary fires whenever entropy exceeds this value -- using the
-    median means roughly half of byte positions become candidate boundary
-    points before the max_patch_size cap and natural clustering kick in.
-    """
-    all_entropies = []
-    for seq in sequences:
-        all_entropies.extend(entropy_model.entropy_profile(seq))
-    all_entropies.sort()
-    idx = min(int(len(all_entropies) * quantile), len(all_entropies) - 1)
-    return all_entropies[idx]
-
-
-def compute_patch_boundaries(entropy_profile, threshold: float, max_patch_size: int = 16):
-    """
-    Converts a per-position entropy profile into per-position PATCH IDS
-    (0-indexed, monotonically non-decreasing left-to-right).
-
-    Rule: start a new patch whenever entropy at this position exceeds the
-    threshold (the model is "surprised" -- treat this as the start of a
-    new chunk of content), OR the current patch has already reached
-    max_patch_size (a safety cap so a long low-entropy run, e.g. repeated
-    bytes, never produces one pathologically huge patch).
-    """
-    patch_ids = []
-    current_patch = 0
-    current_len = 0
-    for i, h in enumerate(entropy_profile):
-        if i > 0 and (h > threshold or current_len >= max_patch_size):
-            current_patch += 1
-            current_len = 0
-        patch_ids.append(current_patch)
-        current_len += 1
-    return patch_ids
+    return [i // patch_size for i in range(seq_len)]
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +74,8 @@ def make_patch_self_mask(patch_valid: torch.Tensor):
     """
     Causal + padding mask at PATCH granularity for the global decoder's
     self-attention. Patch ids are assigned in strictly non-decreasing
-    left-to-right order by compute_patch_boundaries, so causal masking
-    over PATCH INDEX still corresponds exactly to temporal order.
+    left-to-right order, so causal masking over PATCH INDEX still
+    corresponds exactly to temporal order.
     Returns: (batch, 1, num_patches, num_patches) bool.
     """
     batch, num_patches = patch_valid.shape
@@ -210,34 +83,30 @@ def make_patch_self_mask(patch_valid: torch.Tensor):
     pad = make_patch_padding_mask(patch_valid)  # (batch,1,1,P)
     return causal & pad
 
-
-def make_local_decoder_cross_mask(byte_patch_ids: torch.Tensor, patch_valid: torch.Tensor):
-    """
-    For the LOCAL byte decoder's cross-attention into the global decoder's
-    patch latents: byte position i may only attend to patch latents at
-    index <= byte_patch_ids[b, i] -- its own (dynamically-assigned) patch
-    and earlier ones. Unlike fixed-size patching, this can't be derived by
-    floor division -- it uses the ACTUAL per-byte patch assignment tensor.
-    Returns: (batch, 1, byte_len, num_patches) bool.
-    """
+def make_local_decoder_cross_mask(byte_patch_ids, patch_valid):
     batch, byte_len = byte_patch_ids.shape
     num_patches = patch_valid.size(1)
     device = byte_patch_ids.device
 
-    patch_range = torch.arange(num_patches, device=device).view(1, 1, -1)         # (1,1,P)
-    causal_byte_to_patch = (patch_range <= byte_patch_ids.unsqueeze(-1))          # (batch,byte_len,P)
-    causal_byte_to_patch = causal_byte_to_patch.unsqueeze(1)                      # (batch,1,byte_len,P)
+    patch_range = torch.arange(num_patches, device=device).view(1, 1, -1)
+    causal_byte_to_patch = (patch_range < byte_patch_ids.unsqueeze(-1))
 
-    pad = make_patch_padding_mask(patch_valid)  # (batch,1,1,P)
-    return causal_byte_to_patch & pad  # broadcasts -> (batch,1,byte_len,P)
+    # patch-0 bytes have no strictly-earlier patch -- fall back to their
+    # own patch instead of leaving an all-False (NaN-softmax) row
+    no_earlier_patch = ~causal_byte_to_patch.any(dim=-1, keepdim=True)
+    own_patch = (patch_range == byte_patch_ids.unsqueeze(-1))
+    causal_byte_to_patch = causal_byte_to_patch | (no_earlier_patch & own_patch)
 
+    causal_byte_to_patch = causal_byte_to_patch.unsqueeze(1)
+    pad = make_patch_padding_mask(patch_valid)
+    return causal_byte_to_patch & pad
 
 def build_patch_membership(byte_ids: torch.Tensor, patch_ids: torch.Tensor, pad_id: int = PAD_BYTE):
     """
     byte_ids, patch_ids: (batch, seq_len) -- patch_ids gives each byte
-    position's dynamically-assigned patch index (padding positions can
-    hold any placeholder value; they're excluded via the byte-validity
-    check below regardless).
+    position's assigned patch index (padding positions can hold any
+    placeholder value; they're excluded via the byte-validity check below
+    regardless).
 
     Returns:
         membership:  (batch, num_patches, seq_len) bool -- True if byte j
@@ -259,7 +128,7 @@ def build_patch_membership(byte_ids: torch.Tensor, patch_ids: torch.Tensor, pad_
 
 
 # ---------------------------------------------------------------------------
-# Local Encoder: bytes -> DYNAMIC patch representations
+# Local Encoder: bytes -> patch representations
 # ---------------------------------------------------------------------------
 class LocalEncoder(nn.Module):
     """
@@ -270,9 +139,7 @@ class LocalEncoder(nn.Module):
     3. Membership-based cross-attention pooling: ONE learnable query,
        broadcast across all patch "slots", cross-attends over the whole
        byte sequence with a per-patch MEMBERSHIP MASK (which bytes belong
-       to this patch) rather than a fixed contiguous reshape -- this is
-       what makes patch sizes genuinely dynamic/variable instead of a
-       fixed stride.
+       to this patch) rather than a fixed contiguous reshape.
     """
 
     def __init__(self, vocab_size, d_model, n_heads, d_ff, n_layers,
@@ -280,7 +147,7 @@ class LocalEncoder(nn.Module):
         """
         causal: if True, byte self-attention is masked so byte i only sees
             bytes <= i (used for the TARGET-side LocalEncoder -- required
-            regardless of fixed vs dynamic patching, since bidirectional
+            regardless of patching scheme, since bidirectional
             self-attention would let a later byte's information leak into
             an earlier patch's representation).
         """
@@ -303,8 +170,7 @@ class LocalEncoder(nn.Module):
     def forward(self, byte_ids, patch_ids):
         """
         byte_ids, patch_ids: (batch, seq_len) -- patch_ids precomputed
-        upstream (dataset.py) via a trained ByteNgramEntropyModel +
-        compute_patch_boundaries.
+        upstream (dataset.py) via compute_fixed_patch_boundaries.
         Returns:
             patch_emb:   (batch, num_patches, d_model)
             patch_valid: (batch, num_patches) bool
@@ -385,7 +251,7 @@ class LocalDecoder(nn.Module):
     """
     Causal byte-level decoder whose cross-attention "memory" is the global
     decoder's patch latents (not an encoder's token outputs). Cross-attn
-    masking uses the actual per-byte patch assignment (dynamic), via
+    masking uses the actual per-byte patch assignment, via
     make_local_decoder_cross_mask.
     """
 
@@ -416,10 +282,9 @@ class LocalDecoder(nn.Module):
 class BLTSeq2Seq(nn.Module):
     """
     NOTE: patch_ids for both source and target are precomputed UPSTREAM
-    (dataset.py, using a trained ByteNgramEntropyModel + compute_patch_
-    boundaries) and passed into forward directly -- the model itself has
-    no patch_size hyperparameter anymore, since patching is data-dependent
-    and dynamic, not a fixed architectural stride.
+    (dataset.py, using compute_fixed_patch_boundaries) and passed into
+    forward directly -- the model itself has no patch_size hyperparameter,
+    since patching happens entirely as a preprocessing step.
     """
 
     def __init__(self, d_model=128, n_heads=4, d_ff=512,
@@ -488,36 +353,19 @@ if __name__ == "__main__":
     assert cipher_ids[1:-1] == ids[1:-1]
     print("bits_to_byte_ids groups 8 bits -> 1 byte value correctly")
 
-    # --- entropy model + dynamic patch boundaries sanity check ---
-    toy_corpus = [text_to_byte_ids("the cat sat on the mat"),
-                  text_to_byte_ids("the dog sat on the log"),
-                  text_to_byte_ids("the cat ran to the mat")]
-    ngram = ByteNgramEntropyModel(order=3)
-    ngram.train(toy_corpus)
-
-    profile = ngram.entropy_profile(toy_corpus[0])
-    assert len(profile) == len(toy_corpus[0])
-    assert all(h >= 0 for h in profile)
-    print(f"Entropy profile computed, length {len(profile)}, sample values: {[round(h,2) for h in profile[:6]]}")
-
-    threshold = estimate_entropy_threshold(ngram, toy_corpus, quantile=0.5)
-    patch_ids = compute_patch_boundaries(profile, threshold, max_patch_size=8)
-    assert len(patch_ids) == len(profile)
+    # --- fixed-width patch boundaries sanity check ---
+    toy_seq = text_to_byte_ids("the cat sat on the mat")
+    patch_ids = compute_fixed_patch_boundaries(len(toy_seq), patch_size=4)
+    assert len(patch_ids) == len(toy_seq)
     assert patch_ids == sorted(patch_ids)  # non-decreasing
     num_patches = max(patch_ids) + 1
-    assert num_patches > 1, "boundaries degenerated into a single patch -- patching isn't actually dynamic"
-    assert num_patches < len(patch_ids), "every position became its own patch -- check max_patch_size/threshold"
-    print(f"Dynamic patch boundaries: {num_patches} patches over {len(patch_ids)} bytes -> {patch_ids}")
+    assert num_patches > 1
+    print(f"Fixed-width patch boundaries: {num_patches} patches over {len(patch_ids)} bytes -> {patch_ids}")
 
-    # confirm patch sizes are NOT uniform (the defining difference from fixed-width chunking)
-    from collections import Counter as _Counter
-    patch_sizes = list(_Counter(patch_ids).values())
-    assert len(set(patch_sizes)) > 1, "all patches came out the same size -- patching isn't actually dynamic"
-    print(f"Patch sizes vary: {patch_sizes} (confirms genuinely dynamic, not fixed-width)")
-
-    # --- shape check for the full model with dynamic patch_ids ---
+    # --- shape check for the full model with fixed patch_ids ---
     d_model, n_heads, d_ff = 32, 4, 64
     batch, src_len, tgt_len = 3, 17, 13
+    patch_size = 4
 
     model = BLTSeq2Seq(d_model=d_model, n_heads=n_heads, d_ff=d_ff,
                         n_local_layers=1, n_global_enc_layers=1, n_global_dec_layers=1,
@@ -525,13 +373,12 @@ if __name__ == "__main__":
 
     src = torch.randint(0, 256, (batch, src_len))
     tgt_in = torch.randint(0, 256, (batch, tgt_len))
-    # simulate precomputed dynamic patch_ids (monotonic, variable group sizes)
-    src_patch_ids = torch.tensor([sorted([i % 5 for i in range(src_len)]) for _ in range(batch)])
-    tgt_patch_ids = torch.tensor([sorted([i % 4 for i in range(tgt_len)]) for _ in range(batch)])
+    src_patch_ids = torch.tensor([compute_fixed_patch_boundaries(src_len, patch_size) for _ in range(batch)])
+    tgt_patch_ids = torch.tensor([compute_fixed_patch_boundaries(tgt_len, patch_size) for _ in range(batch)])
 
     logits = model(src, src_patch_ids, tgt_in, tgt_patch_ids)
     assert logits.shape == (batch, tgt_len, BYTE_VOCAB_SIZE), logits.shape
-    print("BLT (dynamic patching) full model shape check passed:", logits.shape)
+    print("BLT (fixed patching) full model shape check passed:", logits.shape)
 
     # --- causal correctness: perturbing a LATER byte must not change EARLIER logits ---
     tgt_in2 = tgt_in.clone()
@@ -539,48 +386,45 @@ if __name__ == "__main__":
 
     logits_a = model(src, src_patch_ids, tgt_in, tgt_patch_ids)
     logits_b = model(src, src_patch_ids, tgt_in2, tgt_patch_ids)
+
     last_byte_patch = tgt_patch_ids[0, -1].item()
     earlier_positions = (tgt_patch_ids[0] < last_byte_patch).nonzero(as_tuple=True)[0]
     if len(earlier_positions) > 0:
         cutoff = earlier_positions[-1].item() + 1
+
+        # --- add these three lines here, before the assert ---
+        torch.set_printoptions(precision=10)
+        max_diff_early = (logits_a[:, :cutoff, :] - logits_b[:, :cutoff, :]).abs().max()
+        print("Max diff over 'earlier' region (full precision):", max_diff_early.item())
+        # --------------------------------------------------------
+
         assert torch.allclose(logits_a[:, :cutoff, :], logits_b[:, :cutoff, :], atol=1e-5), \
             "causal leak: earlier patches changed when a later byte was perturbed"
-        print("Causal masking (no future leakage across dynamic patches) check passed")
+        print("Causal masking (no future leakage across patches) check passed")
     else:
         print("Skipping leakage check (perturbed byte's patch is the first patch)")
-
-    # --- tiny-batch overfit check using REAL entropy-based patching end-to-end ---
-    print("\nRunning tiny-batch overfit check (with real entropy-based patching)...")
+    # --- tiny-batch overfit check using fixed-width patching end-to-end ---
+    print("\nRunning tiny-batch overfit check (fixed-width patching)...")
     torch.manual_seed(1)
 
-    small_batch = 6
     toy_texts = ["the cat sat", "the dog ran", "a fox jumped",
                  "birds fly high", "rain falls down", "wind blows hard"]
     toy_tgt_seqs = [text_to_byte_ids(t) for t in toy_texts]
     toy_src_seqs = [text_to_byte_ids(t[::-1]) for t in toy_texts]  # arbitrary distinct source
 
-    tgt_ngram = ByteNgramEntropyModel(order=3)
-    tgt_ngram.train(toy_tgt_seqs)
-    tgt_threshold = estimate_entropy_threshold(tgt_ngram, toy_tgt_seqs, quantile=0.5)
-
-    src_ngram = ByteNgramEntropyModel(order=3)
-    src_ngram.train(toy_src_seqs)
-    src_threshold = estimate_entropy_threshold(src_ngram, toy_src_seqs, quantile=0.5)
-
     max_len = max(max(len(s) for s in toy_src_seqs), max(len(t) for t in toy_tgt_seqs))
 
-    def pad_and_patch(seqs, ngram_model, threshold, max_len):
+    def pad_and_patch(seqs, max_len, patch_size):
         byte_batch, patch_batch = [], []
         for seq in seqs:
-            profile = ngram_model.entropy_profile(seq)
-            p_ids = compute_patch_boundaries(profile, threshold, max_patch_size=8)
+            p_ids = compute_fixed_patch_boundaries(len(seq), patch_size=patch_size)
             pad_amt = max_len - len(seq)
             byte_batch.append(seq + [PAD_BYTE] * pad_amt)
             patch_batch.append(p_ids + [p_ids[-1]] * pad_amt)  # pad patch_ids with last real patch id
         return torch.tensor(byte_batch, dtype=torch.long), torch.tensor(patch_batch, dtype=torch.long)
 
-    toy_src, toy_src_patch = pad_and_patch(toy_src_seqs, src_ngram, src_threshold, max_len)
-    toy_tgt_full, toy_tgt_full_patch = pad_and_patch(toy_tgt_seqs, tgt_ngram, tgt_threshold, max_len)
+    toy_src, toy_src_patch = pad_and_patch(toy_src_seqs, max_len, patch_size=4)
+    toy_tgt_full, toy_tgt_full_patch = pad_and_patch(toy_tgt_seqs, max_len, patch_size=4)
 
     toy_tgt_in = toy_tgt_full[:, :-1]
     toy_tgt_in_patch = toy_tgt_full_patch[:, :-1]
@@ -603,6 +447,6 @@ if __name__ == "__main__":
             print(f"  step {step:4d}  loss {loss.item():.4f}")
 
     assert loss.item() < 0.3, f"BLT tiny-batch overfit did not converge, final loss = {loss.item():.4f}"
-    print("Tiny-batch overfit check passed (dynamic-patching BLT architecture can learn).")
+    print("Tiny-batch overfit check passed (fixed-patching BLT architecture can learn).")
 
     print("\nAll checks passed.")
