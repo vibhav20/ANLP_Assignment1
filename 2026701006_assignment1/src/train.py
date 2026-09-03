@@ -296,8 +296,16 @@ def run_config_c5(train_loader, val_loader, test_loader, patch_size,
         n_global_dec_layers=n_global_dec_layers, dropout=dropout,
     ).to(DEVICE)
  
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # criterion = nn.CrossEntropyLoss(ignore_index=PAD_BYTE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_BYTE)
+
+    # linear warmup over the first 500 steps, then flat at `lr`
+    warmup_steps = 500
+    def lr_lambda(step):
+        return min((step + 1) / warmup_steps, 1.0)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
  
     run = wandb.init(project=wandb_project, name=config_name, reinit=True,
                       config={
@@ -329,11 +337,18 @@ def run_config_c5(train_loader, val_loader, test_loader, patch_size,
             # fn (precomputed once via compute_fixed_patch_boundaries in
             # dataset.py) -- model output length == tgt_in length exactly,
             # so labels need no extra alignment step.
+            # optimizer.zero_grad()
+            # logits = model(src, src_patch_ids, tgt_in, tgt_in_patch_ids)
+            # loss = criterion(logits.reshape(-1, BYTE_VOCAB_SIZE), tgt_labels.reshape(-1))
+            # loss.backward()
+            # optimizer.step()
             optimizer.zero_grad()
             logits = model(src, src_patch_ids, tgt_in, tgt_in_patch_ids)
             loss = criterion(logits.reshape(-1, BYTE_VOCAB_SIZE), tgt_labels.reshape(-1))
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()
  
             total_loss += loss.item()
             n_batches += 1

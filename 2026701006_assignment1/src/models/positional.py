@@ -41,17 +41,6 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    """
-    RoPE: rotates pairs of dimensions in Q/K by an angle proportional to
-    absolute position, such that the dot product of two rotated vectors
-    depends only on their *relative* position (pos_i - pos_j), not their
-    absolute positions.
-
-    Applied to Q and K inside attention, per head, AFTER the head split and
-    BEFORE the QK^T dot product. Not applied to V.
-
-    d_k must be even (pairs of dimensions are rotated together).
-    """
 
     def __init__(self, d_k: int, max_len: int = 5000, base: float = 10000.0):
         super().__init__()
@@ -100,7 +89,7 @@ class RotaryPositionalEmbedding(nn.Module):
     def forward(self, q, k):
         """
         q, k: (batch, n_heads, seq_len, d_k)
-        Returns rotated (q, k). V is passed through untouched by the caller.
+        Returns rotated (q, k). V is passed untouched
         """
         seq_len = q.size(2)
         q_rot = self.apply_rotary(q, seq_len)

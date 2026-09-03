@@ -21,7 +21,11 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from bpe_tokenizer import BPETokenizer
+from .bpe_tokenizer import BPETokenizer
+from .models.blt import (
+    bits_to_byte_ids, text_to_byte_ids, PAD_BYTE, BYTE_VOCAB_SIZE,
+    compute_fixed_patch_boundaries,
+)
 
 
 SEED = 42
@@ -66,7 +70,7 @@ def load_split(path):
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset C1-C4 BPE Tokeniser
 # ---------------------------------------------------------------------------
 class CipherPlaintextDataset(Dataset):
     """
@@ -179,6 +183,153 @@ def build_datasets(cipher_path, plain_path, split_save_path=None,
     return train_loader, val_loader, test_loader, src_tokenizer, tgt_tokenizer
 
 
+# ---------------------------------------------------------------------------
+# Token-free loader (C5 / BLT) -- no tokenizer training at all, since every
+# byte value (0-255) is already a valid id. Reuses load_lines/make_split
+# above so C5 sees the EXACT SAME train/val/test line indices as C1-C4;
+# comparing configs on different held-out data would invalidate the
+# ablation.
+# ---------------------------------------------------------------------------
+class BytePairDataset(Dataset):
+    """
+    Holds precomputed byte ids AND their precomputed patch ids -- patch
+    assignment is computed ONCE per line here, not recomputed every epoch.
+    """
+ 
+    def __init__(self, src_ids_list, src_patch_ids_list, tgt_ids_list, tgt_patch_ids_list):
+        assert len(src_ids_list) == len(tgt_ids_list) == len(src_patch_ids_list) == len(tgt_patch_ids_list)
+        self.src_ids_list = src_ids_list
+        self.src_patch_ids_list = src_patch_ids_list
+        self.tgt_ids_list = tgt_ids_list
+        self.tgt_patch_ids_list = tgt_patch_ids_list
+ 
+    def __len__(self):
+        return len(self.src_ids_list)
+ 
+    def __getitem__(self, idx):
+        return {
+            "src_ids": self.src_ids_list[idx],
+            "src_patch_ids": self.src_patch_ids_list[idx],
+            "tgt_ids": self.tgt_ids_list[idx],
+            "tgt_patch_ids": self.tgt_patch_ids_list[idx],
+        }
+ 
+ 
+def make_byte_collate_fn(pad_id=PAD_BYTE):
+    """
+    Pads byte_ids with pad_id as usual. patch_ids are padded by REPEATING
+    each sequence's last real patch id -- the exact value doesn't affect
+    correctness (padding positions are excluded via the byte-validity
+    check inside build_patch_membership regardless), but repeating the
+    last id keeps patch indices in a sane, non-exploding range.
+    """
+ 
+    def collate_fn(batch):
+        src_seqs = [torch.tensor(ex["src_ids"], dtype=torch.long) for ex in batch]
+        src_patch_seqs = [ex["src_patch_ids"] for ex in batch]
+        tgt_seqs = [torch.tensor(ex["tgt_ids"], dtype=torch.long) for ex in batch]
+        tgt_patch_seqs = [ex["tgt_patch_ids"] for ex in batch]
+ 
+        src_max_len = max(len(s) for s in src_seqs)
+        tgt_max_len = max(len(t) for t in tgt_seqs)
+ 
+        src_padded = torch.full((len(batch), src_max_len), pad_id, dtype=torch.long)
+        tgt_padded = torch.full((len(batch), tgt_max_len), pad_id, dtype=torch.long)
+        src_patch_padded = torch.zeros((len(batch), src_max_len), dtype=torch.long)
+        tgt_patch_padded = torch.zeros((len(batch), tgt_max_len), dtype=torch.long)
+ 
+        for i, (s, sp, t, tp) in enumerate(zip(src_seqs, src_patch_seqs, tgt_seqs, tgt_patch_seqs)):
+            src_padded[i, :len(s)] = s
+            src_patch_padded[i, :len(sp)] = torch.tensor(sp, dtype=torch.long)
+            if len(sp) < src_max_len:
+                src_patch_padded[i, len(sp):] = sp[-1]  # repeat last patch id into the pad region
+ 
+            tgt_padded[i, :len(t)] = t
+            tgt_patch_padded[i, :len(tp)] = torch.tensor(tp, dtype=torch.long)
+            if len(tp) < tgt_max_len:
+                tgt_patch_padded[i, len(tp):] = tp[-1]
+ 
+        tgt_in = tgt_padded[:, :-1]
+        tgt_in_patch_ids = tgt_patch_padded[:, :-1]
+        tgt_labels = tgt_padded[:, 1:]
+ 
+        return {
+            "src": src_padded, "src_patch_ids": src_patch_padded,
+            "tgt_in": tgt_in, "tgt_in_patch_ids": tgt_in_patch_ids,
+            "tgt_labels": tgt_labels,
+        }
+ 
+    return collate_fn
+ 
+ 
+def build_byte_datasets(cipher_path, plain_path, split_save_path=None,
+                         seed=SEED, batch_size=32, max_byte_len=None,
+                         patch_size=4):
+    """
+    Simplified (fixed-width patching) version of the C5 byte-level loader.
+    No entropy model, no n-gram training, no threshold estimation -- byte i
+    is assigned to patch i // patch_size for both src and tgt. This is a
+    valid simplification per the relaxed C5 patching requirement; the rest
+    of the pipeline (BLTSeq2Seq, LocalEncoder's membership-based pooling,
+    the global transformer, LocalDecoder's patch-causal cross-attention)
+    is unchanged and agnostic to how patch_ids were derived.
+ 
+    Returns:
+        train_loader, val_loader, test_loader, patch_size
+ 
+    `patch_size` is returned so train.py's greedy decoding can recompute
+    the target side's patch assignment incrementally with the SAME rule
+    used here (call compute_fixed_patch_boundaries(len_so_far, patch_size)
+    after each generated byte -- no trained model/state to carry around,
+    unlike the entropy version).
+    """
+    cipher_lines = load_lines(cipher_path)
+    plain_lines = load_lines(plain_path)
+    assert len(cipher_lines) == len(plain_lines), "cipher/plaintext line count mismatch"
+ 
+    train_idx, val_idx, test_idx = make_split(len(cipher_lines), seed=seed)
+    if split_save_path is not None:
+        save_split(train_idx, val_idx, test_idx, split_save_path)
+ 
+    # --- convert to byte ids once ---
+    all_src_byte_ids = [bits_to_byte_ids(line) for line in cipher_lines]
+    all_tgt_byte_ids = [text_to_byte_ids(line) for line in plain_lines]
+ 
+    # --- encode all splits: byte ids + fixed-width patch ids ---
+    def encode_split(idx_list):
+        src_ids, src_patch, tgt_ids, tgt_patch = [], [], [], []
+        for i in idx_list:
+            s_ids = all_src_byte_ids[i]
+            t_ids = all_tgt_byte_ids[i]
+            if max_byte_len is not None and (len(s_ids) > max_byte_len or len(t_ids) > max_byte_len):
+                continue
+ 
+            s_patch_ids = compute_fixed_patch_boundaries(len(s_ids), patch_size=patch_size)
+            t_patch_ids = compute_fixed_patch_boundaries(len(t_ids), patch_size=patch_size)
+ 
+            src_ids.append(s_ids)
+            src_patch.append(s_patch_ids)
+            tgt_ids.append(t_ids)
+            tgt_patch.append(t_patch_ids)
+        return src_ids, src_patch, tgt_ids, tgt_patch
+ 
+    train_src, train_src_patch, train_tgt, train_tgt_patch = encode_split(train_idx)
+    val_src, val_src_patch, val_tgt, val_tgt_patch = encode_split(val_idx)
+    test_src, test_src_patch, test_tgt, test_tgt_patch = encode_split(test_idx)
+ 
+    train_ds = BytePairDataset(train_src, train_src_patch, train_tgt, train_tgt_patch)
+    val_ds = BytePairDataset(val_src, val_src_patch, val_tgt, val_tgt_patch)
+    test_ds = BytePairDataset(test_src, test_src_patch, test_tgt, test_tgt_patch)
+ 
+    collate_fn = make_byte_collate_fn(pad_id=PAD_BYTE)
+ 
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+ 
+    return train_loader, val_loader, test_loader, patch_size
+ 
+
 if __name__ == "__main__":
     # --- build a toy cipher_plain pair on disk and run the full pipeline ---
     import tempfile, os
@@ -241,7 +392,7 @@ if __name__ == "__main__":
     print(f"\nExample decoded target: {decoded_tgt!r}")
 
     # --- wire into the actual Seq2SeqTransformer to confirm end-to-end compatibility ---
-    from transformer import Seq2SeqTransformer
+    from .transformer import Seq2SeqTransformer
 
     model = Seq2SeqTransformer(
         src_vocab_size=src_tok.vocab_size,
@@ -254,5 +405,44 @@ if __name__ == "__main__":
     expected_shape = (batch["tgt_in"].shape[0], batch["tgt_in"].shape[1], tgt_tok.vocab_size)
     assert logits.shape == expected_shape, f"{logits.shape} vs {expected_shape}"
     print(f"\nEnd-to-end dataset -> model forward pass check passed: {logits.shape}")
+
+    # --- token-free (C5/BLT) loader check, using the same toy files ---
+    print("\n=== Token-free (byte-level, entropy-based dynamic patching) loader check ===")
+    (byte_train_loader, byte_val_loader, byte_test_loader,
+     src_ngram_model, src_threshold, tgt_ngram_model, tgt_threshold, max_patch_size) = build_byte_datasets(
+        cipher_path, plain_path, split_save_path=os.path.join(tmpdir, "splits_c5.json"),
+        batch_size=4,
+    )
+    print(f"byte train batches: {len(byte_train_loader)}, val: {len(byte_val_loader)}, "
+          f"test: {len(byte_test_loader)}")
+
+    byte_batch = next(iter(byte_train_loader))
+    print("byte batch src shape:", byte_batch["src"].shape)
+    print("byte batch src_patch_ids shape:", byte_batch["src_patch_ids"].shape)
+    assert byte_batch["src"].dtype == torch.long
+    assert byte_batch["src"].shape == byte_batch["src_patch_ids"].shape
+    assert byte_batch["tgt_in"].shape == byte_batch["tgt_labels"].shape
+    assert byte_batch["tgt_in"].shape == byte_batch["tgt_in_patch_ids"].shape
+    print("Byte batch shape/dtype checks passed")
+
+    # confirm patch ids are non-uniform (genuinely dynamic, not fixed stride)
+    from collections import Counter as _Counter
+    example_patch_sizes = list(_Counter(byte_batch["tgt_in_patch_ids"][0].tolist()).values())
+    print(f"Example patch sizes within one line: {example_patch_sizes}")
+
+    from .models.blt import byte_ids_to_text, BLTSeq2Seq
+    byte_ex = byte_train_loader.dataset[0]
+    byte_decoded = byte_ids_to_text(byte_ex["tgt_ids"])
+    print(f"Example decoded target (byte loader): {byte_decoded!r}")
+
+    blt_model = BLTSeq2Seq(d_model=32, n_heads=4, d_ff=64,
+                            n_local_layers=1, n_global_enc_layers=1, n_global_dec_layers=1,
+                            dropout=0.0)
+    blt_logits = blt_model(byte_batch["src"], byte_batch["src_patch_ids"],
+                            byte_batch["tgt_in"], byte_batch["tgt_in_patch_ids"])
+    assert blt_logits.shape[0] == byte_batch["src"].shape[0]
+    assert blt_logits.shape[1] == byte_batch["tgt_in"].shape[1]
+    assert blt_logits.shape[2] == BYTE_VOCAB_SIZE
+    print(f"End-to-end byte loader -> BLTSeq2Seq forward pass check passed: {blt_logits.shape}")
 
     print("\nAll checks passed.")

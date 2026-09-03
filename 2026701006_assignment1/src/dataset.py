@@ -1,19 +1,3 @@
-"""
-dataset.py
-
-Loads the aligned brown_cipher.txt / brown_plain.txt pair, splits into
-train/val/test with a fixed seed, trains TWO from-scratch BPE tokenizers
-(bpe_tokenizer.py) -- one on the cipher side, one on the plaintext side --
-and exposes a torch Dataset + collate_fn that produce padded batches
-compatible with transformer.py's Seq2SeqTransformer.
-
-IMPORTANT: tokenizers are trained ONLY on the train split, never on val/test.
-Training on the full corpus (including val/test lines) would leak
-information about held-out data into the vocabulary itself -- e.g. a merge
-rule that only exists because of a pattern in a test-set line. This keeps
-the evaluation honest.
-"""
-
 import json
 import random
 from pathlib import Path
@@ -30,8 +14,6 @@ from .models.blt import (
 
 SEED = 42
 TRAIN_FRAC, VAL_FRAC = 0.8, 0.1  # remainder -> test
-
-
 # ---------------------------------------------------------------------------
 # Split
 # ---------------------------------------------------------------------------
@@ -73,12 +55,6 @@ def load_split(path):
 # Dataset C1-C4 BPE Tokeniser
 # ---------------------------------------------------------------------------
 class CipherPlaintextDataset(Dataset):
-    """
-    Holds already-tokenized (id-encoded) examples. Encoding happens once,
-    up front, in the loader function below -- not lazily per __getitem__ --
-    since BPE encoding a fixed corpus is comparatively cheap and this keeps
-    __getitem__ trivial.
-    """
 
     def __init__(self, src_ids_list, tgt_ids_list):
         assert len(src_ids_list) == len(tgt_ids_list)
@@ -94,12 +70,9 @@ class CipherPlaintextDataset(Dataset):
             "tgt_ids": self.tgt_ids_list[idx],
         }
 
-
 def make_collate_fn(src_pad_id, tgt_pad_id):
     """
-    Pads a batch to the max length WITHIN that batch (not a fixed global
-    max_len) -- more efficient, and transformer.py's masks are built from
-    the padded tensors directly so variable batch-to-batch length is fine.
+    Pads a batch to the max length WITHIN that batch 
 
     tgt is split here into decoder-input (all but last token) and labels
     (all but first token) for teacher forcing.
@@ -129,8 +102,6 @@ def make_collate_fn(src_pad_id, tgt_pad_id):
         }
 
     return collate_fn
-
-
 # ---------------------------------------------------------------------------
 # Top-level loader: ties everything together
 # ---------------------------------------------------------------------------
@@ -182,13 +153,8 @@ def build_datasets(cipher_path, plain_path, split_save_path=None,
 
     return train_loader, val_loader, test_loader, src_tokenizer, tgt_tokenizer
 
-
 # ---------------------------------------------------------------------------
-# Token-free loader (C5 / BLT) -- no tokenizer training at all, since every
-# byte value (0-255) is already a valid id. Reuses load_lines/make_split
-# above so C5 sees the EXACT SAME train/val/test line indices as C1-C4;
-# comparing configs on different held-out data would invalidate the
-# ablation.
+# Token-free loader (C5 / BLT) : no tokenizer training at all
 # ---------------------------------------------------------------------------
 class BytePairDataset(Dataset):
     """
@@ -328,121 +294,3 @@ def build_byte_datasets(cipher_path, plain_path, split_save_path=None,
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
  
     return train_loader, val_loader, test_loader, patch_size
- 
-
-if __name__ == "__main__":
-    # --- build a toy cipher_plain pair on disk and run the full pipeline ---
-    import tempfile, os
-
-    toy_plain = [
-        "the cat sat on the mat",
-        "the dog sat on the log",
-        "the cat and the dog ran",
-        "a quick brown fox jumps",
-        "the fox ran over the log",
-        "the cat ran to the mat",
-        "birds fly over the trees",
-        "the sun sets in the west",
-        "rain falls on the roof",
-        "the wind blows through trees",
-    ]
-
-    def to_bits(s):
-        return "".join(format(b, "08b") for b in s.encode("utf-8"))
-
-    toy_cipher = [to_bits(line) for line in toy_plain]
-
-    tmpdir = tempfile.mkdtemp()
-    cipher_path = os.path.join(tmpdir, "toy_cipher.txt")
-    plain_path = os.path.join(tmpdir, "toy_plain.txt")
-    split_path = os.path.join(tmpdir, "splits.json")
-
-    with open(cipher_path, "w") as f:
-        f.write("\n".join(toy_cipher) + "\n")
-    with open(plain_path, "w") as f:
-        f.write("\n".join(toy_plain) + "\n")
-
-    train_loader, val_loader, test_loader, src_tok, tgt_tok = build_datasets(
-        cipher_path, plain_path, split_save_path=split_path,
-        src_num_merges=40, tgt_num_merges=40, seed=SEED, batch_size=4,
-    )
-
-    print(f"src vocab size: {src_tok.vocab_size}")
-    print(f"tgt vocab size: {tgt_tok.vocab_size}")
-    print(f"train batches: {len(train_loader)}, val: {len(val_loader)}, test: {len(test_loader)}")
-
-    # pull one batch and check shapes / masking compatibility
-    batch = next(iter(train_loader))
-    print("\nbatch src shape:", batch["src"].shape)
-    print("batch tgt_in shape:", batch["tgt_in"].shape)
-    print("batch tgt_labels shape:", batch["tgt_labels"].shape)
-
-    assert batch["src"].dtype == torch.long
-    assert batch["tgt_in"].shape == batch["tgt_labels"].shape
-    print("Batch shape/dtype checks passed")
-
-    # confirm split reload works and matches
-    r_train, r_val, r_test = load_split(split_path)
-    assert r_train == [i for i in r_train]  # trivial, just confirming load doesn't error
-    print("Split save/load round-trip check passed")
-
-    # end-to-end decode check: decode a src/tgt pair back and sanity print
-    ex = train_loader.dataset[0]
-    decoded_tgt = tgt_tok.decode(ex["tgt_ids"])
-    print(f"\nExample decoded target: {decoded_tgt!r}")
-
-    # --- wire into the actual Seq2SeqTransformer to confirm end-to-end compatibility ---
-    from .transformer import Seq2SeqTransformer
-
-    model = Seq2SeqTransformer(
-        src_vocab_size=src_tok.vocab_size,
-        tgt_vocab_size=tgt_tok.vocab_size,
-        d_model=32, n_heads=4, d_ff=64,
-        n_enc_layers=2, n_dec_layers=2, dropout=0.0,
-        src_pad_idx=src_tok.pad_id, tgt_pad_idx=tgt_tok.pad_id,
-    )
-    logits = model(batch["src"], batch["tgt_in"])
-    expected_shape = (batch["tgt_in"].shape[0], batch["tgt_in"].shape[1], tgt_tok.vocab_size)
-    assert logits.shape == expected_shape, f"{logits.shape} vs {expected_shape}"
-    print(f"\nEnd-to-end dataset -> model forward pass check passed: {logits.shape}")
-
-    # --- token-free (C5/BLT) loader check, using the same toy files ---
-    print("\n=== Token-free (byte-level, entropy-based dynamic patching) loader check ===")
-    (byte_train_loader, byte_val_loader, byte_test_loader,
-     src_ngram_model, src_threshold, tgt_ngram_model, tgt_threshold, max_patch_size) = build_byte_datasets(
-        cipher_path, plain_path, split_save_path=os.path.join(tmpdir, "splits_c5.json"),
-        batch_size=4,
-    )
-    print(f"byte train batches: {len(byte_train_loader)}, val: {len(byte_val_loader)}, "
-          f"test: {len(byte_test_loader)}")
-
-    byte_batch = next(iter(byte_train_loader))
-    print("byte batch src shape:", byte_batch["src"].shape)
-    print("byte batch src_patch_ids shape:", byte_batch["src_patch_ids"].shape)
-    assert byte_batch["src"].dtype == torch.long
-    assert byte_batch["src"].shape == byte_batch["src_patch_ids"].shape
-    assert byte_batch["tgt_in"].shape == byte_batch["tgt_labels"].shape
-    assert byte_batch["tgt_in"].shape == byte_batch["tgt_in_patch_ids"].shape
-    print("Byte batch shape/dtype checks passed")
-
-    # confirm patch ids are non-uniform (genuinely dynamic, not fixed stride)
-    from collections import Counter as _Counter
-    example_patch_sizes = list(_Counter(byte_batch["tgt_in_patch_ids"][0].tolist()).values())
-    print(f"Example patch sizes within one line: {example_patch_sizes}")
-
-    from .models.blt import byte_ids_to_text, BLTSeq2Seq
-    byte_ex = byte_train_loader.dataset[0]
-    byte_decoded = byte_ids_to_text(byte_ex["tgt_ids"])
-    print(f"Example decoded target (byte loader): {byte_decoded!r}")
-
-    blt_model = BLTSeq2Seq(d_model=32, n_heads=4, d_ff=64,
-                            n_local_layers=1, n_global_enc_layers=1, n_global_dec_layers=1,
-                            dropout=0.0)
-    blt_logits = blt_model(byte_batch["src"], byte_batch["src_patch_ids"],
-                            byte_batch["tgt_in"], byte_batch["tgt_in_patch_ids"])
-    assert blt_logits.shape[0] == byte_batch["src"].shape[0]
-    assert blt_logits.shape[1] == byte_batch["tgt_in"].shape[1]
-    assert blt_logits.shape[2] == BYTE_VOCAB_SIZE
-    print(f"End-to-end byte loader -> BLTSeq2Seq forward pass check passed: {blt_logits.shape}")
-
-    print("\nAll checks passed.")
